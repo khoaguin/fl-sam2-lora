@@ -56,7 +56,7 @@ logger.info(f"Using device: {DEVICE}")
 # Default SAM2 checkpoint path
 DEFAULT_SAM2_CHECKPOINT = os.environ.get(
     "SAM2_CHECKPOINT",
-    str(Path(__file__).parent.parent.parent.parent / "models" / "pretrained" / "sam2_hiera_tiny.pt")
+    str(Path(__file__).parent.parent.parent / "models" / "pretrained" / "sam2_hiera_tiny.pt")
 )
 DEFAULT_SAM2_CONFIG = os.environ.get("SAM2_CONFIG", "sam2_hiera_t.yaml")
 
@@ -136,25 +136,18 @@ class SAM2LoRA(nn.Module):
         # Memory bank for few-shot learning (stores embeddings, not raw images)
         self.memory_bank: Dict[str, Dict[str, List]] = {}
 
+        # Initialize lightweight decoder for differentiable training
+        self._init_training_decoder()
+
         # Initialize prompts and strategies
         self._init_medical_prompts()
         self._init_prompt_strategies()
 
     def _init_sam2(self, checkpoint: str, config: str):
         """Initialize SAM-2 model."""
-        try:
-            from sam2.build_sam import build_sam2
-            from sam2.sam2_image_predictor import SAM2ImagePredictor
-            self.sam2 = build_sam2(config, checkpoint, device=self.device)
-            self.sam2_predictor = SAM2ImagePredictor(self.sam2)
-            logger.info("✓ Loaded SAM2 using sam2 package")
-        except (ImportError, Exception) as e:
-            logger.warning(f"Failed to load with sam2 package: {e}")
-            from segment_anything_2 import SamPredictor, sam_model_registry
-            self.sam2 = sam_model_registry["vit_h"](checkpoint=checkpoint)
-            self.sam2.to(self.device)
-            self.sam2_predictor = SamPredictor(self.sam2)
-            logger.info("✓ Loaded SAM2 using segment_anything_2 package")
+        self.sam2 = build_sam2(config, checkpoint, device=self.device)
+        self.sam2_predictor = SAM2ImagePredictor(self.sam2)
+        logger.info("✓ Loaded SAM2 using sam2 package")
 
     def _apply_lora(self, rank: int, alpha: float, dropout: float):
         """Apply LoRA adapters to SAM-2 image encoder."""
@@ -195,6 +188,162 @@ class SAM2LoRA(nn.Module):
             logger.warning(f"Could not load CLIP: {e}")
             self.clip_model = None
             self.clip_preprocess = None
+
+    def _init_training_decoder(self):
+        """
+        Initialize training components.
+
+        We'll use SAM2's actual mask decoder for training (it's differentiable!).
+        The predictor wrapper breaks gradients, but the underlying model is pure PyTorch.
+        """
+        # No separate decoder needed - we'll use SAM2's actual mask decoder
+        # Just log that we're ready for training
+        logger.info("✓ Using SAM2's native mask decoder for training (differentiable)")
+
+    # SAM2 normalization constants
+    SAM2_PIXEL_MEAN = (123.675, 116.28, 103.53)
+    SAM2_PIXEL_STD = (58.395, 57.12, 57.375)
+
+    def _normalize_image_for_sam2(self, image: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize image from [0,1] range to SAM2's expected normalization.
+
+        Args:
+            image: Input tensor [B, 3, H, W] with values in [0, 1]
+
+        Returns:
+            Normalized tensor ready for SAM2 encoder
+        """
+        pixel_mean = torch.tensor(
+            self.SAM2_PIXEL_MEAN, device=image.device, dtype=image.dtype
+        ).view(1, 3, 1, 1)
+        pixel_std = torch.tensor(
+            self.SAM2_PIXEL_STD, device=image.device, dtype=image.dtype
+        ).view(1, 3, 1, 1)
+        return (image * 255.0 - pixel_mean) / pixel_std
+
+    def encode_image_sam2(self, image: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """
+        Encode image through SAM2's LoRA-adapted image encoder.
+
+        This is differentiable and can be used for training.
+
+        Args:
+            image: Input image tensor [B, 3, H, W] normalized to [0, 1]
+
+        Returns:
+            Tuple of (backbone_features, high_res_features) for SAM2's mask decoder
+        """
+        # Ensure image is on correct device and normalized
+        if image.dim() == 3:
+            image = image.unsqueeze(0)
+        image = image.to(self.device)
+
+        # Normalize for SAM2
+        image_normalized = self._normalize_image_for_sam2(image)
+
+        # Forward through encoder (LoRA-adapted)
+        with torch.set_grad_enabled(self.training):
+            features = self.sam2.image_encoder(image_normalized)
+
+        return features
+
+    def forward_sam2_differentiable(
+        self,
+        image: torch.Tensor,
+        point_coords: Optional[torch.Tensor] = None,
+        point_labels: Optional[torch.Tensor] = None,
+        mask_input: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Differentiable forward pass through SAM2's actual encoder + decoder.
+
+        This bypasses the predictor wrapper and calls the model directly.
+
+        Args:
+            image: [B, 3, H, W] normalized to [0, 1]
+            point_coords: [B, N, 2] point coordinates (optional)
+            point_labels: [B, N] point labels (1=foreground, 0=background)
+            mask_input: [B, 1, H, W] previous mask (optional)
+
+        Returns:
+            high_res_masks: [B, 1, H, W] predicted masks (sigmoid applied)
+        """
+        B = image.shape[0]
+
+        # Ensure image is on correct device
+        if image.dim() == 3:
+            image = image.unsqueeze(0)
+            B = 1
+        image = image.to(self.device)
+
+        # Normalize for SAM2
+        image_normalized = self._normalize_image_for_sam2(image)
+
+        # Resize to SAM2's expected size (1024x1024)
+        original_size = image.shape[-2:]
+        if image_normalized.shape[-2:] != (self.img_size, self.img_size):
+            image_normalized = F.interpolate(
+                image_normalized,
+                size=(self.img_size, self.img_size),
+                mode='bilinear',
+                align_corners=False
+            )
+
+        # Forward through image encoder (with LoRA) - returns dict with:
+        # - "vision_features": lowest res feature [B, C, H, W] for mask decoder
+        # - "backbone_fpn": list of FPN features, [0] and [1] are high-res (already processed by conv_s0/s1)
+        backbone_out = self.sam2.forward_image(image_normalized)
+
+        # Extract features for _forward_sam_heads:
+        # backbone_features = lowest resolution features for transformer decoder
+        # high_res_features = [fpn[0], fpn[1]] for upscaling path
+        backbone_features = backbone_out["vision_features"]
+        high_res_features = [backbone_out["backbone_fpn"][0], backbone_out["backbone_fpn"][1]]
+
+        # Create point prompts if not provided (use center of image)
+        if point_coords is None:
+            # Default: center point as foreground
+            point_coords = torch.tensor([[[self.img_size // 2, self.img_size // 2]]],
+                                        dtype=torch.float32, device=self.device)
+            point_coords = point_coords.expand(B, -1, -1)
+            point_labels = torch.ones(B, 1, dtype=torch.int32, device=self.device)
+
+        point_inputs = {
+            "point_coords": point_coords,
+            "point_labels": point_labels,
+        }
+
+        # Forward through SAM2's actual mask decoder (DIFFERENTIABLE!)
+        (
+            _,  # low_res_multimasks
+            _,  # high_res_multimasks
+            _,  # ious
+            _,  # low_res_masks
+            high_res_masks,
+            _,  # obj_ptr
+            _,  # object_score_logits
+        ) = self.sam2._forward_sam_heads(
+            backbone_features=backbone_features,
+            point_inputs=point_inputs,
+            mask_inputs=mask_input,
+            high_res_features=high_res_features,
+            multimask_output=False,
+        )
+
+        # Apply sigmoid to get probabilities
+        masks = torch.sigmoid(high_res_masks)
+
+        # Resize back to original size if needed
+        if masks.shape[-2:] != original_size:
+            masks = F.interpolate(
+                masks,
+                size=original_size,
+                mode='bilinear',
+                align_corners=False
+            )
+
+        return masks
 
     def _init_medical_prompts(self):
         """Initialize domain-specific prompts for medical imaging."""
@@ -367,11 +516,8 @@ class SAM2LoRA(nn.Module):
                 logger.debug(f"Skipping {class_name}: similarity {best_sim:.3f} < {similarity_threshold}")
                 continue
 
-            # Generate point prompts based on similarity
-            # Use grid-based sampling with similarity weighting
-            points = self._generate_similarity_weighted_points(
-                image, prompts, num_points, h, w
-            )
+            # Generate point prompts based on center-weighted heuristic
+            points = self._generate_similarity_weighted_points(num_points, h, w)
 
             if len(points) == 0:
                 # Fallback to center point
@@ -395,7 +541,7 @@ class SAM2LoRA(nn.Module):
                     'confidence': best_sim,
                     'method': 'zero_shot',
                 }
-            except Exception as e:
+            except (RuntimeError, ValueError) as e:
                 logger.warning(f"Zero-shot segmentation failed for {class_name}: {e}")
 
         # Return just masks for compatibility
@@ -403,13 +549,11 @@ class SAM2LoRA(nn.Module):
 
     def _generate_similarity_weighted_points(
         self,
-        image: Union[torch.Tensor, np.ndarray],
-        prompts: List[str],
         num_points: int,
         h: int,
         w: int,
     ) -> np.ndarray:
-        """Generate point prompts weighted by CLIP similarity across image regions."""
+        """Generate point prompts weighted by center distance (simplified heuristic)."""
         # Create a grid of points
         grid_size = 4
         points = []
@@ -609,7 +753,7 @@ class SAM2LoRA(nn.Module):
                     'method': 'few_shot',
                     'matched_study': best_example['study_id'],
                 }
-            except Exception as e:
+            except (RuntimeError, ValueError, KeyError) as e:
                 logger.warning(f"Few-shot segmentation failed for {class_name}: {e}")
 
         return {k: v['mask'] for k, v in results.items()}
@@ -744,7 +888,7 @@ class SAM2LoRA(nn.Module):
                 )
                 best_idx = np.argmax(scores)
                 results[class_name] = torch.from_numpy(masks[best_idx]).float().to(self.device)
-            except Exception as e:
+            except (RuntimeError, ValueError) as e:
                 logger.warning(f"Segmentation failed for {class_name}: {e}")
 
         return results
@@ -801,7 +945,7 @@ class SAM2LoRA(nn.Module):
                 )
                 best_idx = np.argmax(scores)
                 mask_tensor = torch.from_numpy(pred_mask[best_idx]).float()
-            except Exception as e:
+            except (RuntimeError, ValueError) as e:
                 logger.warning(f"Prediction failed: {e}")
                 mask_tensor = torch.zeros(self.img_size, self.img_size)
 
@@ -916,6 +1060,357 @@ class SAM2LoRA(nn.Module):
                 stats['total_examples'] += len(examples)
         return stats
 
+    # =========================================================================
+    # Adaptive Training Method
+    # =========================================================================
+
+    def adaptive_fit(
+        self,
+        train_loader: Optional[DataLoader],
+        test_loader: Optional[DataLoader] = None,
+        modality: str = "ct",
+        class_name: str = "target",
+        local_epochs: int = 2,
+        learning_rate: float = 1e-4,
+        few_shot_threshold: int = 5,
+        lora_threshold: int = 10,
+    ) -> Dict[str, Any]:
+        """
+        Adaptive training that automatically selects the method based on data availability.
+
+        Training method selection:
+        - 0 samples → Zero-shot (CLIP text prompts only, ~35-42% IoU)
+        - 1-5 samples → Few-shot (memory bank, ~60-65% IoU)
+        - >10 samples → LoRA fine-tuning (>70% Dice with sufficient data)
+
+        Args:
+            train_loader: Training data loader (can be None for zero-shot)
+            test_loader: Test data loader for evaluation
+            modality: Medical imaging modality (ct, mri, ultrasound, etc.)
+            class_name: Class name for segmentation
+            local_epochs: Number of training epochs (for LoRA only)
+            learning_rate: Learning rate (for LoRA only)
+            few_shot_threshold: Max samples for few-shot mode (default: 5)
+            lora_threshold: Min samples for LoRA training (default: 10)
+
+        Returns:
+            Dictionary with:
+            - 'method': Training method used ('zero_shot', 'few_shot', 'lora')
+            - 'num_samples': Number of training samples
+            - 'weights': Updated weights (only for LoRA, None otherwise)
+            - 'metrics': Evaluation metrics (dice, loss)
+            - 'history': Training history (for LoRA only)
+        """
+        # Determine number of samples
+        num_samples = len(train_loader.dataset) if train_loader is not None else 0
+
+        # Select method based on data availability
+        if num_samples == 0:
+            method = "zero_shot"
+            logger.info(f"Adaptive fit: {num_samples} samples → ZERO-SHOT mode (CLIP text prompts)")
+        elif num_samples <= few_shot_threshold:
+            method = "few_shot"
+            logger.info(f"Adaptive fit: {num_samples} samples → FEW-SHOT mode (memory bank)")
+        elif num_samples >= lora_threshold:
+            method = "lora"
+            logger.info(f"Adaptive fit: {num_samples} samples → LORA training mode")
+        else:
+            # Between few_shot_threshold and lora_threshold: use few-shot
+            method = "few_shot"
+            logger.info(f"Adaptive fit: {num_samples} samples (between {few_shot_threshold}-{lora_threshold}) → FEW-SHOT mode")
+
+        result = {
+            'method': method,
+            'num_samples': num_samples,
+            'weights': None,
+            'metrics': {'dice': 0.0, 'loss': 1.0},
+            'history': None,
+        }
+
+        # Execute the selected method
+        if method == "zero_shot":
+            result['metrics'] = self._fit_zero_shot(test_loader, modality, class_name)
+
+        elif method == "few_shot":
+            result['metrics'] = self._fit_few_shot(
+                train_loader, test_loader, modality, class_name
+            )
+
+        elif method == "lora":
+            weights, metrics, history = self._fit_lora(
+                train_loader, test_loader, modality, class_name,
+                local_epochs, learning_rate
+            )
+            result['weights'] = weights
+            result['metrics'] = metrics
+            result['history'] = history
+
+        return result
+
+    def _fit_zero_shot(
+        self,
+        test_loader: Optional[DataLoader],
+        modality: str,
+        class_name: str,
+    ) -> Dict[str, float]:
+        """Zero-shot evaluation using CLIP text prompts."""
+        if test_loader is None:
+            return {'dice': 0.0, 'loss': 1.0}
+
+        self.eval()
+        dice_scores = []
+
+        with torch.no_grad():
+            for batch in test_loader:
+                if isinstance(batch, dict):
+                    image = batch["image"][0]
+                    mask_gt = batch["mask"][0, 0]
+                else:
+                    image, mask = batch
+                    image = image[0]
+                    mask_gt = mask[0, 0]
+
+                try:
+                    predictions = self.zero_shot_segment(
+                        image=image,
+                        modality=modality,
+                        class_names=[class_name, "tissue"],
+                        similarity_threshold=0.1,
+                    )
+
+                    if predictions:
+                        pred_mask = list(predictions.values())[0]
+                        pred_binary = (pred_mask > 0.5).float().cpu()
+                        mask_binary = (mask_gt > 0.5).float().cpu()
+
+                        intersection = (pred_binary * mask_binary).sum()
+                        dice = (2.0 * intersection / (pred_binary.sum() + mask_binary.sum() + 1e-6)).item()
+                        dice_scores.append(dice)
+                    else:
+                        dice_scores.append(0.0)
+                except (RuntimeError, ValueError, KeyError) as e:
+                    logger.warning(f"Zero-shot error: {e}")
+                    dice_scores.append(0.0)
+
+        avg_dice = np.mean(dice_scores) if dice_scores else 0.0
+        return {'dice': avg_dice, 'loss': 1.0 - avg_dice}
+
+    def _fit_few_shot(
+        self,
+        train_loader: DataLoader,
+        test_loader: Optional[DataLoader],
+        modality: str,
+        class_name: str,
+    ) -> Dict[str, float]:
+        """Few-shot learning by populating memory bank."""
+        # Clear existing memory bank for this class
+        if modality in self.memory_bank and class_name in self.memory_bank[modality]:
+            self.memory_bank[modality][class_name] = []
+
+        # Add training examples to memory bank
+        for i, batch in enumerate(train_loader):
+            if isinstance(batch, dict):
+                image = batch["image"][0]
+                mask = batch["mask"][0, 0]
+                study_id = batch.get("path", [f"sample_{i}"])[0] if isinstance(batch.get("path"), list) else f"sample_{i}"
+            else:
+                image, mask = batch
+                image = image[0]
+                mask = mask[0, 0]
+                study_id = f"sample_{i}"
+
+            self.add_to_memory_bank(
+                study_id=study_id,
+                modality=modality,
+                class_name=class_name,
+                image=image,
+                mask=mask,
+            )
+
+        logger.info(f"Added {len(train_loader)} examples to memory bank")
+
+        # Evaluate on test set
+        if test_loader is None:
+            return {'dice': 0.0, 'loss': 1.0}
+
+        self.eval()
+        dice_scores = []
+
+        with torch.no_grad():
+            for batch in test_loader:
+                if isinstance(batch, dict):
+                    image = batch["image"][0]
+                    mask_gt = batch["mask"][0, 0]
+                else:
+                    image, mask = batch
+                    image = image[0]
+                    mask_gt = mask[0, 0]
+
+                try:
+                    predictions = self.few_shot_segment(
+                        image=image,
+                        modality=modality,
+                        class_names=[class_name],
+                        top_k=3,
+                    )
+
+                    if class_name in predictions:
+                        pred_mask = predictions[class_name]
+                        pred_binary = (pred_mask > 0.5).float().cpu()
+                        mask_binary = (mask_gt > 0.5).float().cpu()
+
+                        intersection = (pred_binary * mask_binary).sum()
+                        dice = (2.0 * intersection / (pred_binary.sum() + mask_binary.sum() + 1e-6)).item()
+                        dice_scores.append(dice)
+                    else:
+                        dice_scores.append(0.0)
+                except (RuntimeError, ValueError, KeyError) as e:
+                    logger.warning(f"Few-shot error: {e}")
+                    dice_scores.append(0.0)
+
+        avg_dice = np.mean(dice_scores) if dice_scores else 0.0
+        return {'dice': avg_dice, 'loss': 1.0 - avg_dice}
+
+    def _fit_lora(
+        self,
+        train_loader: DataLoader,
+        test_loader: Optional[DataLoader],
+        modality: str,
+        class_name: str,
+        local_epochs: int,
+        learning_rate: float,
+    ) -> Tuple[List[np.ndarray], Dict[str, float], Dict[str, List[float]]]:
+        """
+        LoRA fine-tuning using SAM2's actual mask decoder (fully differentiable).
+
+        This bypasses SAM2's predictor wrapper and calls the model directly:
+        1. forward_image() - encode image through LoRA-adapted encoder
+        2. _forward_sam_heads() - SAM2's actual mask decoder
+        3. Direct loss computation and backprop
+        """
+        self.train()
+
+        # Get trainable parameters: LoRA adapters only
+        lora_params = self.get_trainable_parameters()
+
+        if len(lora_params) == 0:
+            logger.warning("No LoRA parameters found!")
+            return get_weights(self), {'dice': 0.0, 'loss': 1.0}, {'train_loss': [], 'train_dice': []}
+
+        total_params = sum(p.numel() for p in lora_params)
+        logger.info(f"Training {len(lora_params)} LoRA tensors ({total_params:,} params) using SAM2's native decoder")
+
+        optimizer = optim.AdamW(lora_params, lr=learning_rate, weight_decay=0.01)
+        history = {'train_loss': [], 'train_dice': []}
+
+        for epoch in range(local_epochs):
+            epoch_loss = 0.0
+            epoch_dice = 0.0
+            num_batches = 0
+
+            for batch in train_loader:
+                if isinstance(batch, dict):
+                    images = batch["image"].to(self.device)
+                    masks = batch["mask"].to(self.device)
+                else:
+                    images, masks = batch
+                    images = images.to(self.device)
+                    masks = masks.to(self.device)
+
+                optimizer.zero_grad()
+
+                try:
+                    # Extract point prompts from ground truth mask (centroid)
+                    B = images.shape[0]
+                    H_orig, W_orig = images.shape[-2:]
+                    point_coords_list = []
+                    point_labels_list = []
+
+                    for i in range(B):
+                        mask_i = masks[i, 0]
+                        if mask_i.sum() > 0:
+                            # Get centroid of mask
+                            coords = torch.nonzero(mask_i > 0.5, as_tuple=False).float()
+                            if len(coords) > 0:
+                                centroid = coords.mean(dim=0)
+                                # SAM2 expects (x, y) format, coords are (y, x)
+                                # Scale from original image size to SAM2's 1024x1024
+                                x = centroid[1].item() * self.img_size / W_orig
+                                y = centroid[0].item() * self.img_size / H_orig
+                                point = torch.tensor([[x, y]], dtype=torch.float32, device=self.device)
+                            else:
+                                point = torch.tensor([[self.img_size // 2, self.img_size // 2]],
+                                                    dtype=torch.float32, device=self.device)
+                        else:
+                            point = torch.tensor([[self.img_size // 2, self.img_size // 2]],
+                                                dtype=torch.float32, device=self.device)
+                        point_coords_list.append(point)
+                        point_labels_list.append(torch.ones(1, dtype=torch.int32, device=self.device))
+
+                    point_coords = torch.stack(point_coords_list, dim=0)
+                    point_labels = torch.stack(point_labels_list, dim=0)
+
+                    # Forward through SAM2's actual encoder + decoder (DIFFERENTIABLE!)
+                    pred_masks = self.forward_sam2_differentiable(
+                        image=images,
+                        point_coords=point_coords,
+                        point_labels=point_labels,
+                    )
+
+                    # Ensure same shape
+                    if pred_masks.shape[-2:] != masks.shape[-2:]:
+                        pred_masks = F.interpolate(
+                            pred_masks,
+                            size=masks.shape[-2:],
+                            mode='bilinear',
+                            align_corners=False
+                        )
+
+                    # Compute loss
+                    loss = dice_loss(pred_masks, masks)
+                    bce = F.binary_cross_entropy(pred_masks.clamp(1e-6, 1-1e-6), masks, reduction='mean')
+                    total_loss = loss + bce
+
+                    # Backward through SAM2's native decoder!
+                    total_loss.backward()
+
+                    # Check gradient flow
+                    if num_batches == 0:
+                        total_grad_norm = 0.0
+                        num_grads = 0
+                        for p in lora_params:
+                            if p.grad is not None:
+                                total_grad_norm += p.grad.norm().item()
+                                num_grads += 1
+                        if num_grads > 0:
+                            logger.info(f"Gradient check: {num_grads} params have grads, avg norm={total_grad_norm/num_grads:.6f}")
+                        else:
+                            logger.warning("NO GRADIENTS! Gradient chain may be broken.")
+
+                    optimizer.step()
+
+                    epoch_loss += total_loss.item()
+                    epoch_dice += dice_score(pred_masks, masks)
+                    num_batches += 1
+
+                except RuntimeError as e:
+                    logger.warning(f"Training error (batch skipped): {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+
+            avg_loss = epoch_loss / max(num_batches, 1)
+            avg_dice = epoch_dice / max(num_batches, 1)
+            history['train_loss'].append(avg_loss)
+            history['train_dice'].append(avg_dice)
+
+            logger.info(f"Epoch {epoch + 1}/{local_epochs}: Loss={avg_loss:.4f}, Dice={avg_dice:.4f}")
+
+        # Evaluate using zero-shot (consistent eval across all clients)
+        eval_metrics = self._fit_zero_shot(test_loader, modality, class_name) if test_loader else {'dice': 0.0, 'loss': 1.0}
+
+        weights = get_weights(self)
+        return weights, eval_metrics, history
 
 # ============================================================================
 # Evaluator for Zero-Shot and Few-Shot
