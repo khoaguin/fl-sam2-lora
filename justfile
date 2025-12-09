@@ -30,7 +30,12 @@ setup:
     uv sync
     echo "{{ _cyan }}Installing sam2 from git...{{ _nc }}"
     mkdir -p libs
-    cd libs && git clone https://github.com/facebookresearch/sam2.git && cd sam2 && uv pip install -e . && cd ..
+    if [ -d "libs/sam2" ]; then
+        echo "{{ _yellow }}sam2 already exists in libs/, skipping clone{{ _nc }}"
+    else
+        cd libs && git clone https://github.com/facebookresearch/sam2.git
+    fi
+    cd libs/sam2 && uv pip install -e .
     # rm -rf sam2
     echo "{{ _green }}✓ Setup complete!{{ _nc }}"
 

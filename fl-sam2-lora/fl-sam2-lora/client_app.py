@@ -5,6 +5,8 @@ This module implements the client-side federated learning logic for
 Data Owners (hospitals/medical institutions).
 """
 
+import os
+
 from flwr.client import ClientApp, NumPyClient
 from flwr.common import Context
 from loguru import logger
@@ -16,12 +18,14 @@ from fl_sam2_segmentation.task import (
     set_weights,
     train,
     load_demo_dataset,
+    DEFAULT_SAM2_CHECKPOINT,
+    DEFAULT_SAM2_CONFIG,
 )
 
 
 class SAM2LoRAClient(NumPyClient):
     """
-    Flower client wrapping SAM2LoRALite for federated learning.
+    Flower client wrapping SAM2LoRA for federated learning.
 
     This client:
     - Loads local medical imaging data
@@ -118,12 +122,29 @@ def client_fn(context: Context):
 
     from syft_flwr.utils import run_syft_flwr
 
-    # Get config
-    img_size = context.run_config.get("target-size", 512)
+    # Get config from run_config or environment
+    img_size = context.run_config.get("target-size", 1024)
     modality = context.run_config.get("modality", "ct")
+    lora_rank = context.run_config.get("lora-rank", 16)
+    use_clip = context.run_config.get("use-clip", True)
 
-    # Create model
-    model = create_model(img_size=img_size, lora_rank=8)
+    # SAM2 checkpoint configuration
+    sam2_checkpoint = os.environ.get("SAM2_CHECKPOINT", DEFAULT_SAM2_CHECKPOINT)
+    sam2_config = os.environ.get("SAM2_CONFIG", DEFAULT_SAM2_CONFIG)
+
+    print(f"   SAM2 Checkpoint: {sam2_checkpoint}")
+    print(f"   SAM2 Config: {sam2_config}")
+    print(f"   Image Size: {img_size}")
+    print(f"   LoRA Rank: {lora_rank}")
+
+    # Create model with full SAM2 + LoRA
+    model = create_model(
+        sam2_checkpoint=sam2_checkpoint,
+        sam2_config=sam2_config,
+        img_size=img_size,
+        lora_rank=lora_rank,
+        use_clip=use_clip,
+    )
 
     # Load data
     if not run_syft_flwr():

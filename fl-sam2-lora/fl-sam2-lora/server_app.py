@@ -11,7 +11,12 @@ from pathlib import Path
 from flwr.common import Context, ndarrays_to_parameters
 from flwr.server import ServerApp, ServerAppComponents, ServerConfig
 
-from fl_sam2_segmentation.task import create_model, get_weights
+from fl_sam2_segmentation.task import (
+    create_model,
+    get_weights,
+    DEFAULT_SAM2_CHECKPOINT,
+    DEFAULT_SAM2_CONFIG,
+)
 
 
 def weighted_dice_average(metrics):
@@ -61,12 +66,27 @@ def server_fn(context: Context) -> ServerAppComponents:
     print("#" * 80 + "\n")
 
     # Get config
-    img_size = context.run_config.get("target-size", 512)
+    img_size = context.run_config.get("target-size", 1024)
     num_rounds = context.run_config.get("num-server-rounds", 3)
+    lora_rank = context.run_config.get("lora-rank", 16)
+    use_clip = context.run_config.get("use-clip", True)
+
+    # SAM2 checkpoint configuration
+    sam2_checkpoint = os.environ.get("SAM2_CHECKPOINT", DEFAULT_SAM2_CHECKPOINT)
+    sam2_config = os.environ.get("SAM2_CONFIG", DEFAULT_SAM2_CONFIG)
+
+    print(f"   SAM2 Checkpoint: {sam2_checkpoint}")
+    print(f"   SAM2 Config: {sam2_config}")
 
     # Create initial model and get parameters
-    print(" Creating initial SAM2LoRALite model...")
-    model = create_model(img_size=img_size, lora_rank=8)
+    print(" Creating initial SAM2LoRA model...")
+    model = create_model(
+        sam2_checkpoint=sam2_checkpoint,
+        sam2_config=sam2_config,
+        img_size=img_size,
+        lora_rank=lora_rank,
+        use_clip=use_clip,
+    )
     initial_params = ndarrays_to_parameters(get_weights(model))
 
     # Setup output directory for model saving

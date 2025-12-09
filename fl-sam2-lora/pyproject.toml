@@ -58,9 +58,11 @@ fraction-fit = 1.0
 fraction-evaluate = 1.0
 # SAM2 specific config
 modality = "ct"
-target-size = 512
+target-size = 1024
 local-epochs = 3
 learning-rate = 0.0001
+lora-rank = 16
+use-clip = true
 
 [tool.flwr.federations]
 default = "local-simulation"

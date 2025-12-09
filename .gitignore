@@ -14,6 +14,8 @@ dataset/
 models/
 libs/
 docs/plans/
+docs/paper/
 
 # Others
 .DS_Store
+experimentals/
