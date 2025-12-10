@@ -42,11 +42,11 @@ except ImportError:
 
 def get_device():
     """Get the best available device."""
+    # MPS doesn't support bicubic interpolation needed by SAM2, so use CPU on macOS
     if torch.cuda.is_available():
         return torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        return torch.device("mps")
     else:
+        # Use CPU for MPS systems (macOS) due to bicubic interpolation limitation
         return torch.device("cpu")
 
 
@@ -1301,6 +1301,8 @@ class SAM2LoRA(nn.Module):
         logger.info(f"Training {len(lora_params)} LoRA tensors ({total_params:,} params) using SAM2's native decoder")
 
         optimizer = optim.AdamW(lora_params, lr=learning_rate, weight_decay=0.01)
+        # Add learning rate scheduling for better convergence
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=local_epochs, eta_min=learning_rate * 0.1)
         history = {'train_loss': [], 'train_dice': []}
 
         for epoch in range(local_epochs):
@@ -1320,7 +1322,8 @@ class SAM2LoRA(nn.Module):
                 optimizer.zero_grad()
 
                 try:
-                    # Extract point prompts from ground truth mask (centroid)
+                    # Extract point prompts from ground truth mask (enhanced: centroid + random foreground point)
+                    # Using multiple prompts per image provides richer training signal
                     B = images.shape[0]
                     H_orig, W_orig = images.shape[-2:]
                     point_coords_list = []
@@ -1329,26 +1332,60 @@ class SAM2LoRA(nn.Module):
                     for i in range(B):
                         mask_i = masks[i, 0]
                         if mask_i.sum() > 0:
-                            # Get centroid of mask
+                            # Get foreground coordinates
                             coords = torch.nonzero(mask_i > 0.5, as_tuple=False).float()
                             if len(coords) > 0:
+                                # Point 1: Centroid (most reliable)
                                 centroid = coords.mean(dim=0)
-                                # SAM2 expects (x, y) format, coords are (y, x)
-                                # Scale from original image size to SAM2's 1024x1024
-                                x = centroid[1].item() * self.img_size / W_orig
-                                y = centroid[0].item() * self.img_size / H_orig
-                                point = torch.tensor([[x, y]], dtype=torch.float32, device=self.device)
+                                x_cent = centroid[1].item() * self.img_size / W_orig
+                                y_cent = centroid[0].item() * self.img_size / H_orig
+                                
+                                # Point 2: Random foreground point (increases prompt diversity)
+                                if len(coords) > 1:
+                                    rand_idx = torch.randint(0, len(coords), (1,)).item()
+                                    rand_point = coords[rand_idx]
+                                    x_rand = rand_point[1].item() * self.img_size / W_orig
+                                    y_rand = rand_point[0].item() * self.img_size / H_orig
+                                    # Combine both points: [centroid, random]
+                                    points = torch.tensor([[x_cent, y_cent], [x_rand, y_rand]], 
+                                                         dtype=torch.float32, device=self.device)
+                                    labels = torch.ones(2, dtype=torch.int32, device=self.device)
+                                else:
+                                    # Only one point if mask is tiny
+                                    points = torch.tensor([[x_cent, y_cent]], 
+                                                         dtype=torch.float32, device=self.device)
+                                    labels = torch.ones(1, dtype=torch.int32, device=self.device)
                             else:
-                                point = torch.tensor([[self.img_size // 2, self.img_size // 2]],
-                                                    dtype=torch.float32, device=self.device)
+                                # Fallback to center if mask exists but has no coordinates
+                                points = torch.tensor([[self.img_size // 2, self.img_size // 2]],
+                                                     dtype=torch.float32, device=self.device)
+                                labels = torch.ones(1, dtype=torch.int32, device=self.device)
                         else:
-                            point = torch.tensor([[self.img_size // 2, self.img_size // 2]],
-                                                dtype=torch.float32, device=self.device)
-                        point_coords_list.append(point)
-                        point_labels_list.append(torch.ones(1, dtype=torch.int32, device=self.device))
+                            # Empty mask: use center point
+                            points = torch.tensor([[self.img_size // 2, self.img_size // 2]],
+                                                 dtype=torch.float32, device=self.device)
+                            labels = torch.ones(1, dtype=torch.int32, device=self.device)
+                        
+                        point_coords_list.append(points)
+                        point_labels_list.append(labels)
 
-                    point_coords = torch.stack(point_coords_list, dim=0)
-                    point_labels = torch.stack(point_labels_list, dim=0)
+                    # Handle variable-length point arrays by padding to max length
+                    max_points = max(p.shape[0] for p in point_coords_list)
+                    padded_coords = []
+                    padded_labels = []
+                    for coords, labels in zip(point_coords_list, point_labels_list):
+                        if coords.shape[0] < max_points:
+                            # Pad with last point
+                            pad_coords = torch.cat([coords, coords[-1:].repeat(max_points - coords.shape[0], 1)])
+                            pad_labels = torch.cat([labels, labels[-1:].repeat(max_points - labels.shape[0])])
+                        else:
+                            pad_coords = coords
+                            pad_labels = labels
+                        padded_coords.append(pad_coords)
+                        padded_labels.append(pad_labels)
+                    
+                    point_coords = torch.stack(padded_coords, dim=0)  # [B, max_points, 2]
+                    point_labels = torch.stack(padded_labels, dim=0)   # [B, max_points]
 
                     # Forward through SAM2's actual encoder + decoder (DIFFERENTIABLE!)
                     pred_masks = self.forward_sam2_differentiable(
@@ -1366,10 +1403,13 @@ class SAM2LoRA(nn.Module):
                             align_corners=False
                         )
 
-                    # Compute loss
-                    loss = dice_loss(pred_masks, masks)
+                    # Compute improved loss: weighted combination of Dice, BCE, and Focal loss
+                    # This helps with class imbalance and provides more stable gradients
+                    dice = dice_loss(pred_masks, masks)
                     bce = F.binary_cross_entropy(pred_masks.clamp(1e-6, 1-1e-6), masks, reduction='mean')
-                    total_loss = loss + bce
+                    focal = focal_loss(pred_masks, masks, alpha=0.25, gamma=2.0)
+                    # Weighted combination: dice (0.5) + bce (0.3) + focal (0.2)
+                    total_loss = 0.5 * dice + 0.3 * bce + 0.2 * focal
 
                     # Backward through SAM2's native decoder!
                     total_loss.backward()
@@ -1399,12 +1439,16 @@ class SAM2LoRA(nn.Module):
                     traceback.print_exc()
                     continue
 
+            # Step learning rate scheduler
+            scheduler.step()
+
             avg_loss = epoch_loss / max(num_batches, 1)
             avg_dice = epoch_dice / max(num_batches, 1)
             history['train_loss'].append(avg_loss)
             history['train_dice'].append(avg_dice)
-
-            logger.info(f"Epoch {epoch + 1}/{local_epochs}: Loss={avg_loss:.4f}, Dice={avg_dice:.4f}")
+            
+            current_lr = scheduler.get_last_lr()[0]
+            logger.info(f"Epoch {epoch + 1}/{local_epochs}: Loss={avg_loss:.4f}, Dice={avg_dice:.4f}, LR={current_lr:.6f}")
 
         # Evaluate using zero-shot (consistent eval across all clients)
         eval_metrics = self._fit_zero_shot(test_loader, modality, class_name) if test_loader else {'dice': 0.0, 'loss': 1.0}
@@ -1609,6 +1653,16 @@ def dice_loss(pred: torch.Tensor, target: torch.Tensor, smooth: float = 1.0) -> 
     union = pred.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
     dice = (2.0 * intersection + smooth) / (union + smooth)
     return 1 - dice.mean()
+
+
+def focal_loss(pred: torch.Tensor, target: torch.Tensor, alpha: float = 0.25, gamma: float = 2.0) -> torch.Tensor:
+    """Focal loss for handling class imbalance."""
+    pred = pred.float().clamp(1e-6, 1 - 1e-6)
+    target = target.float()
+    bce = F.binary_cross_entropy(pred, target, reduction='none')
+    pt = torch.where(target == 1, pred, 1 - pred)
+    focal_weight = alpha * (1 - pt) ** gamma
+    return (focal_weight * bce).mean()
 
 
 def dice_score(pred: torch.Tensor, target: torch.Tensor) -> float:

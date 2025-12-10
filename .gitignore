@@ -1,23 +1,27 @@
-# Python-generated files
+# SAM2 cloned repository (not part of main codebase)
+segment-anything-2/
+
+# Temporary test/helper scripts
+test_*.py
+verify_*.py
+run_*_pipeline.py
+
+# Documentation that's temporary
+RUN_PIPELINE.md
+INSTALLATION_COMPLETE.md
+EXPECTED_RESULTS.md
+
+# Python cache
 __pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
+*.pyc
+*.pyo
+*.pyd
+.Python
 
-# Virtual environments
-.venv
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
 
-# data, docs, libs, models
-dataset/
-models/
-libs/
-docs/plans/
-docs/paper/
+# Output files
+*.log
+*.json
 outputs/
-logs/
-
-# Others
-.DS_Store
-experimentals/

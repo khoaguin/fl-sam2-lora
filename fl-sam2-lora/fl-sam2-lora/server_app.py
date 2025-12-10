@@ -126,9 +126,10 @@ def server_fn(context: Context) -> ServerAppComponents:
         fit_metrics_aggregation_fn=weighted_dice_average,
         evaluate_metrics_aggregation_fn=weighted_dice_average,
         # Custom config to pass to clients
+        # Improved defaults for LoRA training: more epochs, slightly lower LR for stability
         on_fit_config_fn=lambda round_num: {
-            "local_epochs": context.run_config.get("local-epochs", 3),
-            "learning_rate": context.run_config.get("learning-rate", 1e-4),
+            "local_epochs": context.run_config.get("local-epochs", 5),  # Increased from 3 to 5 for better convergence
+            "learning_rate": context.run_config.get("learning-rate", 5e-5),  # Lower LR (5e-5) for more stable LoRA training
             "round": round_num,
         },
     )
