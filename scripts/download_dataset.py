@@ -2,16 +2,14 @@
 """
 Download and organize the Chest CT Segmentation dataset from Kaggle.
 """
-import os
 import kagglehub
 from pathlib import Path
 import shutil
 
-# Set Kaggle API token
-os.environ["KAGGLE_API_TOKEN"] = "KGAT_5df2b06df133abf2ab9a49d25225d655"
-
-# Project root
-PROJECT_ROOT = Path("/Users/edwin/Desktop/Business/Technological/fl-sam2-lora")
+# Project root - use relative paths for portability
+# Script is in scripts/, so parent.parent is project root
+# Note: Kaggle API credentials should be configured in ~/.kaggle/kaggle.json
+PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 DATASET_DIR = PROJECT_ROOT / "dataset" / "chest-ct-segmentation"
 
 print("=" * 60)

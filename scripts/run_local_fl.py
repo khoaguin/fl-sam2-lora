@@ -39,8 +39,9 @@ except ImportError:
 import sys
 from pathlib import Path
 
-# Project paths
-PROJECT_ROOT = Path("/Users/edwin/Desktop/Business/Technological/fl-sam2-lora")
+# Project paths - use relative paths for portability
+# Script is in scripts/, so parent.parent is project root
+PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 TASK_MODULE_PATH = PROJECT_ROOT / "fl-sam2-lora" / "fl-sam2-lora"
 SAM2_LIB_PATH = PROJECT_ROOT / "segment-anything-2"
 
@@ -85,7 +86,7 @@ except ImportError as e:
     print("  Continuing anyway - task.py will handle this...")
 
 # Load task.py directly
-task_path = Path("/Users/edwin/Desktop/Business/Technological/fl-sam2-lora/fl-sam2-lora/fl-sam2-lora/task.py")
+task_path = PROJECT_ROOT / "fl-sam2-lora" / "fl-sam2-lora" / "task.py"
 spec = importlib.util.spec_from_file_location("task", task_path)
 task = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(task)

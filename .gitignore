@@ -29,3 +29,13 @@ outputs/
 # Large binary files (datasets and model checkpoints)
 dataset/
 models/
+
+# docs
+docs/plans
+docs/paper
+
+# Mac OS files
+.DS_Store
+
+# experiments
+experimentals/
