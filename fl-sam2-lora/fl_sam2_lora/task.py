@@ -18,7 +18,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import clip
+import open_clip
 import numpy as np
 import torch
 import torch.nn as nn
@@ -201,6 +201,7 @@ class SAM2LoRA(nn.Module):
         else:
             self.clip_model = None
             self.clip_preprocess = None
+            self.clip_tokenizer = None
 
         # Memory bank for few-shot learning (stores embeddings, not raw images)
         self.memory_bank: Dict[str, Dict[str, List]] = {}
@@ -250,17 +251,25 @@ class SAM2LoRA(nn.Module):
 
     def _init_clip(self, model_name: str):
         """Initialize CLIP for zero-shot and visual similarity."""
-        logger.info("Loading CLIP for zero-shot and few-shot...")
+        logger.info("Loading CLIP (open-clip-torch) for zero-shot and few-shot...")
         try:
-            self.clip_model, self.clip_preprocess = clip.load(model_name, device=self.device)
+            # Convert OpenAI CLIP model name to open_clip format
+            # ViT-B/32 -> ViT-B-32, ViT-L/14 -> ViT-L-14
+            open_clip_name = model_name.replace("/", "-")
+            self.clip_model, _, self.clip_preprocess = open_clip.create_model_and_transforms(
+                open_clip_name, pretrained='openai'
+            )
+            self.clip_model = self.clip_model.to(self.device)
+            self.clip_tokenizer = open_clip.get_tokenizer(open_clip_name)
             self.clip_model.eval()
             for param in self.clip_model.parameters():
                 param.requires_grad = False
-            logger.info("✓ CLIP loaded")
+            logger.info("✓ CLIP loaded (open-clip-torch)")
         except Exception as e:
             logger.warning(f"Could not load CLIP: {e}")
             self.clip_model = None
             self.clip_preprocess = None
+            self.clip_tokenizer = None
 
     def _init_training_decoder(self):
         """
@@ -492,10 +501,10 @@ class SAM2LoRA(nn.Module):
 
     def encode_text_prompts(self, prompts: List[str]) -> torch.Tensor:
         """Encode text prompts with CLIP."""
-        if self.clip_model is None:
+        if self.clip_model is None or self.clip_tokenizer is None:
             return None
 
-        text_tokens = clip.tokenize(prompts, truncate=True).to(self.device)
+        text_tokens = self.clip_tokenizer(prompts).to(self.device)
         with torch.no_grad():
             features = self.clip_model.encode_text(text_tokens)
             features = F.normalize(features, dim=-1)
