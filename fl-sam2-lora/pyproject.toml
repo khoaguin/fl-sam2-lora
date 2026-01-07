@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fl-sam2-lora"
-version = "1.0.0"
+version = "0.1.0"
 requires-python = ">=3.10"
 description = "Federated Learning for Medical Image Segmentation using SAM2 with LoRA"
 license = "Apache-2.0"
@@ -33,19 +33,17 @@ dependencies = [
 
 [tool.uv.sources.syft-flwr]
 git = "https://github.com/OpenMined/syft-flwr/"
-branch = "feat/syft-client-p2p"
+branch = "main"
 
 [tool.hatch.build.targets.wheel]
-packages = [
-    ".",
-]
+packages = ["."]
 
 [tool.flwr.app]
 publisher = "OpenMined"
 
 [tool.flwr.app.components]
-serverapp = "fl_sam2_segmentation.server_app:app"
-clientapp = "fl_sam2_segmentation.client_app:app"
+serverapp = "fl_sam2_lora.server_app:app"
+clientapp = "fl_sam2_lora.client_app:app"
 
 [tool.flwr.app.config]
 num-server-rounds = 3

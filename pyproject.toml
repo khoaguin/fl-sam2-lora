@@ -27,5 +27,5 @@ dependencies = [
 git = "https://github.com/openai/CLIP.git"
 
 [tool.uv.sources.syft-flwr]
-path = "/Users/khoaguin/Desktop/projects/OpenMined/syft-flwr"
-editable = true
+git = "https://github.com/OpenMined/syft-flwr/"
+branch = "main"
