@@ -42,3 +42,7 @@ experimentals/
 
 # libs
 libs/
+
+# AI stuff
+.claude/
+CLAUDE.md
