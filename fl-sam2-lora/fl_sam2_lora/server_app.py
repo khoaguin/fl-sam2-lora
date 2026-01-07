@@ -3,6 +3,11 @@ Flower Server App for Federated Medical Image Segmentation with SAM2 LoRA.
 
 This module implements the server-side federated learning logic for
 the Data Scientist (aggregator).
+
+Supports heterogeneous clients:
+- Zero-shot clients (no data): Participate but don't contribute weights
+- Few-shot clients (1-5 samples): Participate but don't contribute weights
+- LoRA clients (>10 samples): Full training, contribute weights to FedAvg
 """
 
 import os
@@ -11,7 +16,7 @@ from pathlib import Path
 from flwr.common import Context, ndarrays_to_parameters
 from flwr.server import ServerApp, ServerAppComponents, ServerConfig
 
-from fl_sam2_segmentation.task import (
+from fl_sam2_lora.task import (
     create_model,
     get_weights,
     DEFAULT_SAM2_CHECKPOINT,
@@ -23,29 +28,41 @@ def weighted_dice_average(metrics):
     """
     Aggregate Dice scores from all clients weighted by number of samples.
 
-    This provides a fair average across clients with different dataset sizes.
+    Handles heterogeneous clients:
+    - LoRA clients: Weighted by num_samples
+    - Zero-shot/Few-shot: Included with weight 1 (for fair comparison)
     """
     print("\n" + "=" * 80)
     print("AGGREGATING METRICS FROM CLIENTS")
     print(f"   Number of clients: {len(metrics)}")
     print("=" * 80)
 
-    # Aggregate Dice scores
-    dice_scores = []
-    examples = []
+    # Separate clients by type
+    lora_metrics = []
+    other_metrics = []
 
     for num_examples, m in metrics:
-        if "dice" in m:
-            dice_scores.append(num_examples * m["dice"])
-            examples.append(num_examples)
-        elif "train_dice" in m:
-            dice_scores.append(num_examples * m["train_dice"])
-            examples.append(num_examples)
+        method = m.get("method", "lora")
+        dice = m.get("dice", m.get("train_dice", 0.0))
 
-    if examples:
-        avg_dice = sum(dice_scores) / sum(examples)
-        print(f" AGGREGATION COMPLETE - Average Dice Score: {avg_dice:.4f}\n")
-        return {"dice": avg_dice}
+        if method == "lora":
+            lora_metrics.append((num_examples, dice))
+            print(f"   LoRA client: {num_examples} samples, Dice={dice:.4f}")
+        else:
+            other_metrics.append((1, dice))  # Weight 1 for non-training clients
+            print(f"   {method.upper()} client: Dice={dice:.4f} (no weight contribution)")
+
+    # Compute weighted average
+    all_metrics = lora_metrics + other_metrics
+    if all_metrics:
+        total_weight = sum(w for w, _ in all_metrics)
+        weighted_sum = sum(w * d for w, d in all_metrics)
+        avg_dice = weighted_sum / total_weight if total_weight > 0 else 0.0
+        print(f"\n AGGREGATION COMPLETE")
+        print(f"   LoRA clients: {len(lora_metrics)}")
+        print(f"   Other clients: {len(other_metrics)}")
+        print(f"   Average Dice Score: {avg_dice:.4f}\n")
+        return {"dice": avg_dice, "lora_clients": len(lora_metrics), "other_clients": len(other_metrics)}
     else:
         print(" No metrics to aggregate\n")
         return {}
@@ -114,6 +131,12 @@ def server_fn(context: Context) -> ServerAppComponents:
     print(f"   Fraction fit: {fraction_fit}")
     print(f"   Fraction evaluate: {fraction_evaluate}")
 
+    # Get FedProx configuration
+    use_fedprox = context.run_config.get("use-fedprox", True)
+    fedprox_mu = context.run_config.get("fedprox-mu", 1e-3)
+
+    print(f"   FedProx: {'Enabled' if use_fedprox else 'Disabled'} (μ={fedprox_mu})")
+
     # Create FedAvg strategy with model saving
     strategy = FedAvgWithModelSaving(
         save_path=save_path,
@@ -126,11 +149,13 @@ def server_fn(context: Context) -> ServerAppComponents:
         fit_metrics_aggregation_fn=weighted_dice_average,
         evaluate_metrics_aggregation_fn=weighted_dice_average,
         # Custom config to pass to clients
-        # Improved defaults for LoRA training: more epochs, slightly lower LR for stability
         on_fit_config_fn=lambda round_num: {
-            "local_epochs": context.run_config.get("local-epochs", 5),  # Increased from 3 to 5 for better convergence
-            "learning_rate": context.run_config.get("learning-rate", 5e-5),  # Lower LR (5e-5) for more stable LoRA training
+            "local_epochs": context.run_config.get("local-epochs", 5),
+            "learning_rate": context.run_config.get("learning-rate", 5e-5),
             "round": round_num,
+            # FedProx regularization for stable FL training
+            "use_fedprox": use_fedprox,
+            "fedprox_mu": fedprox_mu,
         },
     )
 

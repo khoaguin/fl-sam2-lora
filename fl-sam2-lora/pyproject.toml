@@ -36,16 +36,14 @@ git = "https://github.com/OpenMined/syft-flwr/"
 branch = "main"
 
 [tool.hatch.build.targets.wheel]
-packages = [
-    ".",
-]
+packages = ["."]
 
 [tool.flwr.app]
 publisher = "OpenMined"
 
 [tool.flwr.app.components]
-serverapp = "fl_sam2_segmentation.server_app:app"
-clientapp = "fl_sam2_segmentation.client_app:app"
+serverapp = "fl_sam2_lora.server_app:app"
+clientapp = "fl_sam2_lora.client_app:app"
 
 [tool.flwr.app.config]
 num-server-rounds = 3

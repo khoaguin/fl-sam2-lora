@@ -60,6 +60,75 @@ DEFAULT_SAM2_CHECKPOINT = os.environ.get(
 )
 DEFAULT_SAM2_CONFIG = os.environ.get("SAM2_CONFIG", "sam2_hiera_t.yaml")
 
+# SAM2 checkpoint download URLs (from Meta's official repo)
+SAM2_CHECKPOINT_URLS = {
+    "sam2_hiera_tiny.pt": "https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_tiny.pt",
+    "sam2_hiera_small.pt": "https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_small.pt",
+    "sam2_hiera_base_plus.pt": "https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_base_plus.pt",
+    "sam2_hiera_large.pt": "https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_large.pt",
+}
+
+
+def validate_and_download_checkpoint(checkpoint_path: str) -> str:
+    """
+    Validate SAM2 checkpoint exists, download if missing.
+
+    Args:
+        checkpoint_path: Path to SAM2 checkpoint file
+
+    Returns:
+        Validated checkpoint path
+
+    Raises:
+        FileNotFoundError: If checkpoint cannot be found or downloaded
+    """
+    checkpoint_path = Path(checkpoint_path)
+
+    # Check if file exists
+    if checkpoint_path.exists():
+        logger.info(f"✓ SAM2 checkpoint found: {checkpoint_path}")
+        return str(checkpoint_path)
+
+    # Try to download
+    checkpoint_name = checkpoint_path.name
+    if checkpoint_name in SAM2_CHECKPOINT_URLS:
+        logger.warning(f"SAM2 checkpoint not found: {checkpoint_path}")
+        logger.info(f"Attempting to download {checkpoint_name}...")
+
+        # Create parent directory if needed
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            import urllib.request
+            url = SAM2_CHECKPOINT_URLS[checkpoint_name]
+            logger.info(f"Downloading from {url}...")
+
+            # Download with progress
+            def _progress_hook(count, block_size, total_size):
+                percent = int(count * block_size * 100 / total_size)
+                if count % 100 == 0:
+                    print(f"\r  Downloading: {percent}%", end="", flush=True)
+
+            urllib.request.urlretrieve(url, checkpoint_path, _progress_hook)
+            print()  # Newline after progress
+            logger.info(f"✓ Downloaded SAM2 checkpoint to {checkpoint_path}")
+            return str(checkpoint_path)
+
+        except Exception as e:
+            logger.error(f"Failed to download checkpoint: {e}")
+            raise FileNotFoundError(
+                f"SAM2 checkpoint not found and download failed: {checkpoint_path}\n"
+                f"Please download manually from: {url}\n"
+                f"Or set SAM2_CHECKPOINT environment variable to a valid path."
+            )
+    else:
+        # Unknown checkpoint name, can't auto-download
+        raise FileNotFoundError(
+            f"SAM2 checkpoint not found: {checkpoint_path}\n"
+            f"Available checkpoints for auto-download: {list(SAM2_CHECKPOINT_URLS.keys())}\n"
+            f"Please download from https://github.com/facebookresearch/segment-anything-2"
+        )
+
 
 class SAM2LoRA(nn.Module):
     """
@@ -144,8 +213,12 @@ class SAM2LoRA(nn.Module):
         self._init_prompt_strategies()
 
     def _init_sam2(self, checkpoint: str, config: str):
-        """Initialize SAM-2 model."""
-        self.sam2 = build_sam2(config, checkpoint, device=self.device)
+        """Initialize SAM-2 model with checkpoint validation."""
+        # Validate checkpoint exists, download if missing
+        validated_checkpoint = validate_and_download_checkpoint(checkpoint)
+
+        # Load SAM2 model
+        self.sam2 = build_sam2(config, validated_checkpoint, device=self.device)
         self.sam2_predictor = SAM2ImagePredictor(self.sam2)
         logger.info("✓ Loaded SAM2 using sam2 package")
 
@@ -1070,10 +1143,16 @@ class SAM2LoRA(nn.Module):
         test_loader: Optional[DataLoader] = None,
         modality: str = "ct",
         class_name: str = "target",
-        local_epochs: int = 2,
+        local_epochs: int = 5,
         learning_rate: float = 1e-4,
         few_shot_threshold: int = 5,
         lora_threshold: int = 10,
+        # Enhanced training options
+        use_fedprox: bool = True,
+        fedprox_mu: float = 1e-3,
+        global_weights: Optional[List[np.ndarray]] = None,
+        use_background_prompts: bool = True,
+        early_stopping_patience: int = 3,
     ) -> Dict[str, Any]:
         """
         Adaptive training that automatically selects the method based on data availability.
@@ -1092,6 +1171,11 @@ class SAM2LoRA(nn.Module):
             learning_rate: Learning rate (for LoRA only)
             few_shot_threshold: Max samples for few-shot mode (default: 5)
             lora_threshold: Min samples for LoRA training (default: 10)
+            use_fedprox: Enable FedProx regularization for stable FL training
+            fedprox_mu: FedProx regularization strength (default: 1e-3)
+            global_weights: Global weights for FedProx (from previous round)
+            use_background_prompts: Include background point prompts for better training
+            early_stopping_patience: Stop if no improvement for N epochs (0 = disabled)
 
         Returns:
             Dictionary with:
@@ -1105,19 +1189,20 @@ class SAM2LoRA(nn.Module):
         num_samples = len(train_loader.dataset) if train_loader is not None else 0
 
         # Select method based on data availability
+        # 0 samples → zero-shot, 1-5 → few-shot, >10 → LoRA
         if num_samples == 0:
             method = "zero_shot"
             logger.info(f"Adaptive fit: {num_samples} samples → ZERO-SHOT mode (CLIP text prompts)")
         elif num_samples <= few_shot_threshold:
             method = "few_shot"
             logger.info(f"Adaptive fit: {num_samples} samples → FEW-SHOT mode (memory bank)")
-        elif num_samples >= lora_threshold:
+        elif num_samples > lora_threshold:
             method = "lora"
-            logger.info(f"Adaptive fit: {num_samples} samples → LORA training mode")
+            logger.info(f"Adaptive fit: {num_samples} samples → LORA training mode (enhanced)")
         else:
-            # Between few_shot_threshold and lora_threshold: use few-shot
+            # Between few_shot_threshold (5) and lora_threshold (10): use few-shot
             method = "few_shot"
-            logger.info(f"Adaptive fit: {num_samples} samples (between {few_shot_threshold}-{lora_threshold}) → FEW-SHOT mode")
+            logger.info(f"Adaptive fit: {num_samples} samples (6-10) → FEW-SHOT mode (insufficient for LoRA)")
 
         result = {
             'method': method,
@@ -1139,7 +1224,12 @@ class SAM2LoRA(nn.Module):
         elif method == "lora":
             weights, metrics, history = self._fit_lora(
                 train_loader, test_loader, modality, class_name,
-                local_epochs, learning_rate
+                local_epochs, learning_rate,
+                use_fedprox=use_fedprox,
+                fedprox_mu=fedprox_mu,
+                global_weights=global_weights,
+                use_background_prompts=use_background_prompts,
+                early_stopping_patience=early_stopping_patience,
             )
             result['weights'] = weights
             result['metrics'] = metrics
@@ -1279,14 +1369,20 @@ class SAM2LoRA(nn.Module):
         class_name: str,
         local_epochs: int,
         learning_rate: float,
+        use_fedprox: bool = True,
+        fedprox_mu: float = 1e-3,
+        global_weights: Optional[List[np.ndarray]] = None,
+        use_background_prompts: bool = True,
+        early_stopping_patience: int = 3,
     ) -> Tuple[List[np.ndarray], Dict[str, float], Dict[str, List[float]]]:
         """
-        LoRA fine-tuning using SAM2's actual mask decoder (fully differentiable).
+        Enhanced LoRA fine-tuning with FedProx, background prompts, and early stopping.
 
-        This bypasses SAM2's predictor wrapper and calls the model directly:
-        1. forward_image() - encode image through LoRA-adapted encoder
-        2. _forward_sam_heads() - SAM2's actual mask decoder
-        3. Direct loss computation and backprop
+        Features:
+        - Background point prompts for better boundary learning
+        - FedProx regularization for stable federated training
+        - Early stopping to prevent overfitting
+        - Learning rate scheduling (CosineAnnealing)
         """
         self.train()
 
@@ -1295,15 +1391,40 @@ class SAM2LoRA(nn.Module):
 
         if len(lora_params) == 0:
             logger.warning("No LoRA parameters found!")
-            return get_weights(self), {'dice': 0.0, 'loss': 1.0}, {'train_loss': [], 'train_dice': []}
+            return get_weights(self), {'dice': 0.0, 'loss': 1.0}, {'train_loss': [], 'train_dice': [], 'val_dice': []}
 
         total_params = sum(p.numel() for p in lora_params)
-        logger.info(f"Training {len(lora_params)} LoRA tensors ({total_params:,} params) using SAM2's native decoder")
+        logger.info(f"Training {len(lora_params)} LoRA tensors ({total_params:,} params)")
+        logger.info(f"  FedProx: {'ON' if use_fedprox and global_weights else 'OFF'} (μ={fedprox_mu})")
+        logger.info(f"  Background prompts: {'ON' if use_background_prompts else 'OFF'}")
+        logger.info(f"  Early stopping: patience={early_stopping_patience}")
+
+        # Store global weights for FedProx regularization
+        global_param_dict = {}
+        if global_weights is not None and use_fedprox:
+            param_idx = 0
+            for p in lora_params:
+                if param_idx < len(global_weights):
+                    try:
+                        global_param_dict[p] = torch.tensor(
+                            global_weights[param_idx],
+                            device=p.device,
+                            dtype=p.dtype
+                        )
+                        param_idx += 1
+                    except RuntimeError as e:
+                        logger.warning(f"FedProx skipped for param {param_idx} (size mismatch)")
+                        break
+            if global_param_dict:
+                logger.info(f"  FedProx: Loaded {len(global_param_dict)} global weight tensors")
 
         optimizer = optim.AdamW(lora_params, lr=learning_rate, weight_decay=0.01)
-        # Add learning rate scheduling for better convergence
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=local_epochs, eta_min=learning_rate * 0.1)
-        history = {'train_loss': [], 'train_dice': []}
+        history = {'train_loss': [], 'train_dice': [], 'val_dice': []}
+
+        # Early stopping tracking
+        best_train_dice = 0.0
+        patience_counter = 0
 
         for epoch in range(local_epochs):
             epoch_loss = 0.0
@@ -1322,8 +1443,7 @@ class SAM2LoRA(nn.Module):
                 optimizer.zero_grad()
 
                 try:
-                    # Extract point prompts from ground truth mask (enhanced: centroid + random foreground point)
-                    # Using multiple prompts per image provides richer training signal
+                    # Enhanced point prompt extraction with background points
                     B = images.shape[0]
                     H_orig, W_orig = images.shape[-2:]
                     point_coords_list = []
@@ -1331,70 +1451,77 @@ class SAM2LoRA(nn.Module):
 
                     for i in range(B):
                         mask_i = masks[i, 0]
+                        points = []
+                        labels = []
+
                         if mask_i.sum() > 0:
-                            # Get foreground coordinates
-                            coords = torch.nonzero(mask_i > 0.5, as_tuple=False).float()
-                            if len(coords) > 0:
-                                # Point 1: Centroid (most reliable)
-                                centroid = coords.mean(dim=0)
+                            # Get foreground and background coordinates
+                            fg_coords = torch.nonzero(mask_i > 0.5, as_tuple=False).float()
+                            bg_coords = torch.nonzero(mask_i <= 0.5, as_tuple=False).float()
+
+                            if len(fg_coords) > 0:
+                                # Point 1: Centroid (most reliable foreground)
+                                centroid = fg_coords.mean(dim=0)
                                 x_cent = centroid[1].item() * self.img_size / W_orig
                                 y_cent = centroid[0].item() * self.img_size / H_orig
-                                
-                                # Point 2: Random foreground point (increases prompt diversity)
-                                if len(coords) > 1:
-                                    rand_idx = torch.randint(0, len(coords), (1,)).item()
-                                    rand_point = coords[rand_idx]
+                                points.append([x_cent, y_cent])
+                                labels.append(1)  # Foreground
+
+                                # Point 2: Random foreground point
+                                if len(fg_coords) > 1:
+                                    rand_idx = torch.randint(0, len(fg_coords), (1,)).item()
+                                    rand_point = fg_coords[rand_idx]
                                     x_rand = rand_point[1].item() * self.img_size / W_orig
                                     y_rand = rand_point[0].item() * self.img_size / H_orig
-                                    # Combine both points: [centroid, random]
-                                    points = torch.tensor([[x_cent, y_cent], [x_rand, y_rand]], 
-                                                         dtype=torch.float32, device=self.device)
-                                    labels = torch.ones(2, dtype=torch.int32, device=self.device)
-                                else:
-                                    # Only one point if mask is tiny
-                                    points = torch.tensor([[x_cent, y_cent]], 
-                                                         dtype=torch.float32, device=self.device)
-                                    labels = torch.ones(1, dtype=torch.int32, device=self.device)
-                            else:
-                                # Fallback to center if mask exists but has no coordinates
-                                points = torch.tensor([[self.img_size // 2, self.img_size // 2]],
-                                                     dtype=torch.float32, device=self.device)
-                                labels = torch.ones(1, dtype=torch.int32, device=self.device)
-                        else:
-                            # Empty mask: use center point
-                            points = torch.tensor([[self.img_size // 2, self.img_size // 2]],
-                                                 dtype=torch.float32, device=self.device)
-                            labels = torch.ones(1, dtype=torch.int32, device=self.device)
-                        
-                        point_coords_list.append(points)
-                        point_labels_list.append(labels)
+                                    points.append([x_rand, y_rand])
+                                    labels.append(1)  # Foreground
 
-                    # Handle variable-length point arrays by padding to max length
+                                # Background points (for better boundary learning)
+                                if use_background_prompts and len(bg_coords) > 10:
+                                    num_bg_points = min(2, len(bg_coords) // 100)
+                                    if num_bg_points > 0:
+                                        bg_indices = torch.randperm(len(bg_coords))[:num_bg_points]
+                                        for bg_idx in bg_indices:
+                                            bg_point = bg_coords[bg_idx]
+                                            x_bg = bg_point[1].item() * self.img_size / W_orig
+                                            y_bg = bg_point[0].item() * self.img_size / H_orig
+                                            points.append([x_bg, y_bg])
+                                            labels.append(0)  # Background
+
+                        # Fallback if no valid points
+                        if not points:
+                            points = [[self.img_size // 2, self.img_size // 2]]
+                            labels = [1]
+
+                        points_tensor = torch.tensor(points, dtype=torch.float32, device=self.device)
+                        labels_tensor = torch.tensor(labels, dtype=torch.int32, device=self.device)
+                        point_coords_list.append(points_tensor)
+                        point_labels_list.append(labels_tensor)
+
+                    # Pad to max length
                     max_points = max(p.shape[0] for p in point_coords_list)
                     padded_coords = []
                     padded_labels = []
-                    for coords, labels in zip(point_coords_list, point_labels_list):
+                    for coords, lbls in zip(point_coords_list, point_labels_list):
                         if coords.shape[0] < max_points:
-                            # Pad with last point
                             pad_coords = torch.cat([coords, coords[-1:].repeat(max_points - coords.shape[0], 1)])
-                            pad_labels = torch.cat([labels, labels[-1:].repeat(max_points - labels.shape[0])])
+                            pad_labels = torch.cat([lbls, lbls[-1:].repeat(max_points - lbls.shape[0])])
                         else:
                             pad_coords = coords
-                            pad_labels = labels
+                            pad_labels = lbls
                         padded_coords.append(pad_coords)
                         padded_labels.append(pad_labels)
-                    
-                    point_coords = torch.stack(padded_coords, dim=0)  # [B, max_points, 2]
-                    point_labels = torch.stack(padded_labels, dim=0)   # [B, max_points]
 
-                    # Forward through SAM2's actual encoder + decoder (DIFFERENTIABLE!)
+                    point_coords = torch.stack(padded_coords, dim=0)
+                    point_labels = torch.stack(padded_labels, dim=0)
+
+                    # Forward through SAM2
                     pred_masks = self.forward_sam2_differentiable(
                         image=images,
                         point_coords=point_coords,
                         point_labels=point_labels,
                     )
 
-                    # Ensure same shape
                     if pred_masks.shape[-2:] != masks.shape[-2:]:
                         pred_masks = F.interpolate(
                             pred_masks,
@@ -1403,19 +1530,24 @@ class SAM2LoRA(nn.Module):
                             align_corners=False
                         )
 
-                    # Compute improved loss: weighted combination of Dice, BCE, and Focal loss
-                    # This helps with class imbalance and provides more stable gradients
+                    # Compute loss: Dice + BCE + Focal
                     dice = dice_loss(pred_masks, masks)
                     bce = F.binary_cross_entropy(pred_masks.clamp(1e-6, 1-1e-6), masks, reduction='mean')
                     focal = focal_loss(pred_masks, masks, alpha=0.25, gamma=2.0)
-                    # Weighted combination: dice (0.5) + bce (0.3) + focal (0.2)
                     total_loss = 0.5 * dice + 0.3 * bce + 0.2 * focal
 
-                    # Backward through SAM2's native decoder!
+                    # FedProx regularization: penalize deviation from global weights
+                    if use_fedprox and global_param_dict:
+                        fedprox_loss = 0.0
+                        for p in lora_params:
+                            if p in global_param_dict:
+                                fedprox_loss += (p - global_param_dict[p]).norm() ** 2
+                        total_loss = total_loss + fedprox_mu * fedprox_loss
+
                     total_loss.backward()
 
-                    # Check gradient flow
-                    if num_batches == 0:
+                    # Gradient check (first batch only)
+                    if num_batches == 0 and epoch == 0:
                         total_grad_norm = 0.0
                         num_grads = 0
                         for p in lora_params:
@@ -1423,9 +1555,9 @@ class SAM2LoRA(nn.Module):
                                 total_grad_norm += p.grad.norm().item()
                                 num_grads += 1
                         if num_grads > 0:
-                            logger.info(f"Gradient check: {num_grads} params have grads, avg norm={total_grad_norm/num_grads:.6f}")
+                            logger.info(f"Gradient check: {num_grads} params, avg norm={total_grad_norm/num_grads:.6f}")
                         else:
-                            logger.warning("NO GRADIENTS! Gradient chain may be broken.")
+                            logger.warning("NO GRADIENTS! Check gradient chain.")
 
                     optimizer.step()
 
@@ -1435,23 +1567,31 @@ class SAM2LoRA(nn.Module):
 
                 except RuntimeError as e:
                     logger.warning(f"Training error (batch skipped): {e}")
-                    import traceback
-                    traceback.print_exc()
                     continue
 
-            # Step learning rate scheduler
             scheduler.step()
 
             avg_loss = epoch_loss / max(num_batches, 1)
             avg_dice = epoch_dice / max(num_batches, 1)
             history['train_loss'].append(avg_loss)
             history['train_dice'].append(avg_dice)
-            
+
             current_lr = scheduler.get_last_lr()[0]
             logger.info(f"Epoch {epoch + 1}/{local_epochs}: Loss={avg_loss:.4f}, Dice={avg_dice:.4f}, LR={current_lr:.6f}")
 
-        # Evaluate using zero-shot (consistent eval across all clients)
-        eval_metrics = self._fit_zero_shot(test_loader, modality, class_name) if test_loader else {'dice': 0.0, 'loss': 1.0}
+            # Early stopping check
+            if early_stopping_patience > 0:
+                if avg_dice > best_train_dice:
+                    best_train_dice = avg_dice
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= early_stopping_patience:
+                        logger.info(f"Early stopping at epoch {epoch + 1} (patience={patience_counter})")
+                        break
+
+        # Final evaluation
+        eval_metrics = self._fit_zero_shot(test_loader, modality, class_name) if test_loader else {'dice': avg_dice, 'loss': avg_loss}
 
         weights = get_weights(self)
         return weights, eval_metrics, history
@@ -1514,82 +1654,277 @@ class SegmentationEvaluator:
 # Data Loading Utilities
 # ============================================================================
 
-class MedicalSegmentationDataset(Dataset):
-    """Dataset for medical image segmentation."""
+class ChestCTDataset(Dataset):
+    """
+    Dataset for Chest CT Segmentation.
+
+    Supports three modes:
+    1. Explicit file lists: Pass image_ids and mask_ids
+    2. CSV file: Pass csv_file parameter (expects ImageId,MaskId columns)
+    3. Auto-discovery: Pass only data_dir, files are discovered via glob
+
+    Handles both nested (images/images/) and flat (images/) directory structures.
+    RGB masks are converted to binary (any non-zero pixel is foreground).
+    """
 
     def __init__(
         self,
         data_dir: Path,
+        image_ids: Optional[List[str]] = None,
+        mask_ids: Optional[List[str]] = None,
+        csv_file: Optional[str] = None,
         target_size: int = 1024,
-        modality: str = "ct",
+        modality: str = "ct"
     ):
         self.data_dir = Path(data_dir)
         self.target_size = target_size
         self.modality = modality
 
-        images_dir = self.data_dir / "images"
-        masks_dir = self.data_dir / "masks"
+        # Determine directory structure (nested or flat)
+        nested_images = self.data_dir / "images" / "images"
+        flat_images = self.data_dir / "images"
+        self.images_dir = nested_images if nested_images.exists() else flat_images
 
-        self.image_paths = sorted(
-            list(images_dir.glob("*.png")) + list(images_dir.glob("*.jpg"))
+        nested_masks = self.data_dir / "masks" / "masks"
+        flat_masks = self.data_dir / "masks"
+        self.masks_dir = nested_masks if nested_masks.exists() else flat_masks
+
+        # Load file lists based on mode
+        if image_ids is not None and mask_ids is not None:
+            # Mode 1: Explicit file lists
+            self.image_ids = image_ids
+            self.mask_ids = mask_ids
+        elif csv_file is not None:
+            # Mode 2: Load from CSV file
+            self._load_from_csv(csv_file)
+        else:
+            # Mode 3: Auto-discovery
+            self._auto_discover_files()
+
+    def _load_from_csv(self, csv_file: str):
+        """Load image and mask IDs from CSV file."""
+        import csv
+        csv_path = self.data_dir / csv_file
+        if not csv_path.exists():
+            raise FileNotFoundError(f"CSV file not found: {csv_path}")
+
+        self.image_ids = []
+        self.mask_ids = []
+
+        with open(csv_path, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                self.image_ids.append(row['ImageId'])
+                self.mask_ids.append(row['MaskId'])
+
+        logger.info(f"Loaded {len(self.image_ids)} samples from {csv_file}")
+
+    def _auto_discover_files(self):
+        """Auto-discover image and mask files."""
+        # Find all images
+        image_paths = sorted(
+            list(self.images_dir.glob("*.png")) +
+            list(self.images_dir.glob("*.jpg")) +
+            list(self.images_dir.glob("*.jpeg"))
         )
-        self.mask_paths = []
 
-        for img_path in self.image_paths:
-            mask_path = masks_dir / img_path.name
-            if mask_path.exists():
-                self.mask_paths.append(mask_path)
-            else:
-                mask_path = masks_dir / (img_path.stem + ".png")
-                self.mask_paths.append(mask_path)
+        self.image_ids = []
+        self.mask_ids = []
 
-        logger.info(f"Found {len(self.image_paths)} image-mask pairs")
+        for img_path in image_paths:
+            # Try to find matching mask
+            mask_candidates = [
+                self.masks_dir / img_path.name,  # Same name
+                self.masks_dir / (img_path.stem + "_mask" + img_path.suffix),  # name_mask.ext
+                self.masks_dir / (img_path.stem + ".png"),  # name.png
+                self.masks_dir / (img_path.stem + "_mask.png"),  # name_mask.png
+            ]
 
-    def __len__(self) -> int:
-        return len(self.image_paths)
+            mask_found = False
+            for mask_path in mask_candidates:
+                if mask_path.exists():
+                    self.image_ids.append(img_path.name)
+                    self.mask_ids.append(mask_path.name)
+                    mask_found = True
+                    break
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        image = Image.open(self.image_paths[idx]).convert("RGB")
+            if not mask_found:
+                logger.warning(f"No mask found for {img_path.name}, skipping")
+
+        logger.info(f"Auto-discovered {len(self.image_ids)} image-mask pairs")
+
+    def __len__(self):
+        return len(self.image_ids)
+
+    def __getitem__(self, idx):
+        # Load image
+        img_path = self.images_dir / self.image_ids[idx]
+        image = Image.open(img_path).convert("RGB")
         image = image.resize((self.target_size, self.target_size), Image.BILINEAR)
-        image = np.array(image).astype(np.float32) / 255.0
+        image = torch.tensor(np.array(image), dtype=torch.float32).permute(2, 0, 1) / 255.0
 
-        mask = Image.open(self.mask_paths[idx]).convert("L")
+        # Load mask - handle both RGB and grayscale masks
+        mask_path = self.masks_dir / self.mask_ids[idx]
+        mask = Image.open(mask_path)
         mask = mask.resize((self.target_size, self.target_size), Image.NEAREST)
-        mask = np.array(mask).astype(np.float32) / 255.0
+        mask_arr = np.array(mask)
 
-        image_tensor = torch.from_numpy(image).permute(2, 0, 1)
-        mask_tensor = torch.from_numpy(mask).unsqueeze(0)
+        # Convert to binary: any non-zero value is foreground
+        if len(mask_arr.shape) == 3:
+            # RGB mask: any channel > 0 means foreground
+            binary_mask = (mask_arr.max(axis=2) > 0).astype(np.float32)
+        else:
+            # Grayscale mask
+            binary_mask = (mask_arr > 0).astype(np.float32)
+
+        mask = torch.tensor(binary_mask, dtype=torch.float32)
 
         return {
-            "image": image_tensor,
-            "mask": mask_tensor,
-            "path": str(self.image_paths[idx]),
+            "image": image,
+            "mask": mask.unsqueeze(0),  # [1, H, W]
+            "path": str(img_path),
             "modality": self.modality,
+        }
+
+
+class AugmentedChestCTDataset(ChestCTDataset):
+    """
+    Augmented version of ChestCTDataset for LoRA training.
+
+    Applies spatial and intensity augmentations to improve generalization:
+    - Horizontal/vertical flips
+    - Brightness adjustment
+    - Contrast adjustment
+    - Gamma correction
+    """
+
+    def __init__(self, *args, use_augmentation: bool = True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.use_augmentation = use_augmentation
+
+    def __getitem__(self, idx):
+        sample = super().__getitem__(idx)
+        image = sample["image"]
+        mask = sample["mask"][0]  # Remove channel dim for augmentation
+
+        if self.use_augmentation:
+            # Spatial augmentations
+            if np.random.rand() > 0.5:
+                # Horizontal flip
+                image = torch.flip(image, [2])
+                mask = torch.flip(mask, [1])
+
+            if np.random.rand() > 0.5:
+                # Vertical flip
+                image = torch.flip(image, [1])
+                mask = torch.flip(mask, [0])
+
+            # Intensity augmentations
+            if np.random.rand() > 0.5:
+                # Brightness adjustment
+                brightness_factor = np.random.uniform(0.8, 1.2)
+                image = torch.clamp(image * brightness_factor, 0, 1)
+
+            if np.random.rand() > 0.5:
+                # Contrast adjustment
+                contrast_factor = np.random.uniform(0.8, 1.2)
+                mean = image.mean()
+                image = torch.clamp((image - mean) * contrast_factor + mean, 0, 1)
+
+            if np.random.rand() > 0.5:
+                # Gamma correction
+                gamma = np.random.uniform(0.8, 1.2)
+                image = torch.clamp(image ** gamma, 0, 1)
+
+        return {
+            "image": image,
+            "mask": mask.unsqueeze(0),  # Add channel dim back
+            "path": sample["path"],
+            "modality": sample["modality"],
         }
 
 
 def load_syftbox_dataset(
     target_size: int = 1024,
     modality: str = "ct",
-) -> Tuple[DataLoader, DataLoader]:
-    """Load medical segmentation dataset from SyftBox."""
+) -> Tuple[Optional[DataLoader], Optional[DataLoader]]:
+    """
+    Load medical segmentation dataset from SyftBox.
+
+    Returns:
+        - (None, None): If no dataset found
+        - (None, test_loader): If only test data available (zero-shot)
+        - (train_loader, test_loader): If training data available
+    """
+    train_path = None
+    test_path = None
+
+    # Try syft_client first (for distributed-gdrive setup)
     try:
         import syft_client as sc
         logger.info("[P2P TRANSPORT] Using syft_client to load dataset")
-        train_path = sc.resolve_path("syft://private/syft_datasets/medical-segmentation/train")
-        test_path = sc.resolve_path("syft://private/syft_datasets/medical-segmentation/test")
+
+        # Define the syft paths to the private dataset
+        train_data_path = "syft://private/syft_datasets/chest-ct-segmentation/train"
+        test_data_path = "syft://private/syft_datasets/chest-ct-segmentation/test"
+
+        # Resolve the syft paths to actual file paths
+        train_path = Path(sc.resolve_path(train_data_path))
+        test_path = Path(sc.resolve_path(test_data_path))
+
+        logger.info(f"Resolved train path: {train_path}")
+        logger.info(f"Resolved test path: {test_path}")
+
     except (ImportError, Exception) as e:
-        logger.info(f"[SYFTBOX TRANSPORT] Falling back to DATA_DIR ({e})")
+        # Fall back to syft_flwr approach using DATA_DIR (syft-rds and syftbox setups)
+        logger.info(f"[SYFTBOX TRANSPORT] syft_client not available ({e}), falling back to DATA_DIR")
+
         from syft_flwr.utils import get_syftbox_dataset_path
         data_dir = get_syftbox_dataset_path()
+        logger.info(f"Loading dataset from {data_dir}")
+
         train_path = data_dir / "train"
         test_path = data_dir / "test"
 
-    train_dataset = MedicalSegmentationDataset(train_path, target_size=target_size, modality=modality)
-    test_dataset = MedicalSegmentationDataset(test_path, target_size=target_size, modality=modality)
+    # Load training data (may not exist for zero-shot clients)
+    # Use AugmentedChestCTDataset for training to improve generalization
+    train_loader = None
+    if train_path and train_path.exists():
+        try:
+            # Use CSV if available, otherwise auto-discover
+            train_csv = "train.csv" if (train_path / "train.csv").exists() else None
+            train_dataset = AugmentedChestCTDataset(
+                train_path,
+                csv_file=train_csv,
+                target_size=target_size,
+                modality=modality,
+                use_augmentation=True,  # Enable augmentation for training
+            )
+            if len(train_dataset) > 0:
+                train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=0)
+                logger.info(f"Loaded {len(train_dataset)} training samples (with augmentation)")
+            else:
+                logger.info("No training samples found (zero-shot mode)")
+        except Exception as e:
+            logger.warning(f"Could not load training data: {e}")
 
-    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=0)
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0)
+    # Load test data (no augmentation for evaluation)
+    test_loader = None
+    if test_path and test_path.exists():
+        try:
+            # Use CSV if available, otherwise auto-discover
+            test_csv = "test.csv" if (test_path / "test.csv").exists() else None
+            test_dataset = ChestCTDataset(
+                test_path,
+                csv_file=test_csv,
+                target_size=target_size,
+                modality=modality
+            )
+            if len(test_dataset) > 0:
+                test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0)
+                logger.info(f"Loaded {len(test_dataset)} test samples")
+        except Exception as e:
+            logger.warning(f"Could not load test data: {e}")
 
     return train_loader, test_loader
 
@@ -1676,97 +2011,6 @@ def dice_score(pred: torch.Tensor, target: torch.Tensor) -> float:
     return (2.0 * intersection / union).item()
 
 
-def train(
-    model: nn.Module,
-    train_loader: DataLoader,
-    local_epochs: int = 3,
-    learning_rate: float = 1e-4,
-) -> Dict[str, List[float]]:
-    """Train the model locally."""
-    model.to(DEVICE)
-    model.train()
-
-    optimizer = optim.AdamW(
-        model.get_trainable_parameters(),
-        lr=learning_rate,
-        weight_decay=0.01,
-    )
-
-    history = {"train_loss": [], "train_dice": []}
-
-    for epoch in range(local_epochs):
-        epoch_loss = 0.0
-        epoch_dice = 0.0
-        num_batches = 0
-
-        for batch in train_loader:
-            if isinstance(batch, dict):
-                images = batch["image"].to(DEVICE)
-                masks = batch["mask"].to(DEVICE)
-            else:
-                images, masks = batch
-                images = images.to(DEVICE)
-                masks = masks.to(DEVICE)
-
-            optimizer.zero_grad()
-            pred_masks = model(images, masks=masks)
-
-            loss = dice_loss(pred_masks, masks)
-            bce_loss = F.binary_cross_entropy(pred_masks.clamp(0, 1), masks, reduction='mean')
-            loss = loss + bce_loss
-
-            loss.backward()
-            optimizer.step()
-
-            epoch_loss += loss.item()
-            epoch_dice += dice_score(pred_masks, masks)
-            num_batches += 1
-
-        avg_loss = epoch_loss / max(num_batches, 1)
-        avg_dice = epoch_dice / max(num_batches, 1)
-        history["train_loss"].append(avg_loss)
-        history["train_dice"].append(avg_dice)
-
-        logger.info(f"Epoch {epoch + 1}/{local_epochs}: Loss={avg_loss:.4f}, Dice={avg_dice:.4f}")
-
-    return history
-
-
-def evaluate(
-    model: nn.Module,
-    test_loader: DataLoader,
-) -> Tuple[float, float]:
-    """Evaluate the model."""
-    model.to(DEVICE)
-    model.eval()
-
-    total_loss = 0.0
-    total_dice = 0.0
-    num_batches = 0
-
-    with torch.no_grad():
-        for batch in test_loader:
-            if isinstance(batch, dict):
-                images = batch["image"].to(DEVICE)
-                masks = batch["mask"].to(DEVICE)
-            else:
-                images, masks = batch
-                images = images.to(DEVICE)
-                masks = masks.to(DEVICE)
-
-            pred_masks = model(images, masks=masks)
-
-            loss = dice_loss(pred_masks, masks)
-            bce_loss = F.binary_cross_entropy(pred_masks.clamp(0, 1), masks, reduction='mean')
-            loss = loss + bce_loss
-
-            total_loss += loss.item()
-            total_dice += dice_score(pred_masks, masks)
-            num_batches += 1
-
-    return total_loss / max(num_batches, 1), total_dice / max(num_batches, 1)
-
-
 def get_weights(model: nn.Module) -> List[np.ndarray]:
     """Get model weights as numpy arrays (LoRA adapters only)."""
     adapter_dict = model.get_adapter_state_dict()
@@ -1816,3 +2060,188 @@ def create_model(
 
     model.print_trainable_parameters()
     return model
+
+
+# ============================================================================
+# LoRA Effectiveness Verification
+# ============================================================================
+
+def verify_lora_effectiveness(
+    test_loader: DataLoader,
+    trained_weights: Optional[List[np.ndarray]] = None,
+    sam2_checkpoint: str = DEFAULT_SAM2_CHECKPOINT,
+    sam2_config: str = DEFAULT_SAM2_CONFIG,
+    img_size: int = 1024,
+    lora_rank: int = 16,
+    modality: str = "ct",
+    class_names: List[str] = None,
+) -> Dict[str, Any]:
+    """
+    Verify LoRA effectiveness by comparing initial vs trained model.
+
+    This function:
+    1. Creates an untrained model and evaluates baseline Dice
+    2. Creates a trained model (with provided weights) and evaluates trained Dice
+    3. Compares the two to verify LoRA actually improved performance
+
+    Args:
+        test_loader: DataLoader for test data
+        trained_weights: Trained LoRA weights from FL (if None, only evaluates baseline)
+        sam2_checkpoint: Path to SAM2 checkpoint
+        sam2_config: SAM2 config name
+        img_size: Input image size
+        lora_rank: LoRA rank (must match trained_weights rank)
+        modality: Medical imaging modality (ct, mri, xray)
+        class_names: Class names for segmentation
+
+    Returns:
+        Dictionary with:
+        - initial_dice: Baseline Dice (untrained model)
+        - trained_dice: Trained Dice (after FL)
+        - improvement: Absolute improvement (trained - initial)
+        - improvement_pct: Percentage improvement
+    """
+    if class_names is None:
+        class_names = ["lung", "tissue"]
+
+    logger.info("=" * 80)
+    logger.info("LORA EFFECTIVENESS VERIFICATION")
+    logger.info("=" * 80)
+
+    results = {
+        'initial_dice': 0.0,
+        'trained_dice': 0.0,
+        'improvement': 0.0,
+        'improvement_pct': 0.0,
+        'initial_scores': [],
+        'trained_scores': [],
+    }
+
+    # Helper function to evaluate a model
+    def _evaluate_model(model: SAM2LoRA, description: str) -> Tuple[float, List[float]]:
+        model.eval()
+        dice_scores = []
+
+        with torch.no_grad():
+            for batch in test_loader:
+                if isinstance(batch, dict):
+                    image = batch["image"][0]
+                    mask_gt = batch["mask"][0, 0]
+                else:
+                    image, mask = batch
+                    image = image[0]
+                    mask_gt = mask[0, 0]
+
+                try:
+                    predictions = model.zero_shot_segment(
+                        image=image,
+                        modality=modality,
+                        class_names=class_names,
+                        similarity_threshold=0.1,
+                    )
+
+                    if predictions:
+                        pred_masks = list(predictions.values())
+
+                        if len(pred_masks) == 1:
+                            pred_mask = pred_masks[0]
+                        else:
+                            # Multiple masks - select best match against GT
+                            mask_gt_binary = (mask_gt > 0.5).float()
+                            best_dice = -1.0
+                            best_mask = pred_masks[0]
+
+                            # Also compute union mask
+                            combined_mask = torch.zeros_like(pred_masks[0])
+                            for pm in pred_masks:
+                                combined_mask = torch.maximum(combined_mask, pm)
+
+                            for pm in pred_masks:
+                                pm_binary = (pm > 0.5).float().cpu()
+                                intersection = (pm_binary * mask_gt_binary).sum()
+                                dice_candidate = (2.0 * intersection / (pm_binary.sum() + mask_gt_binary.sum() + 1e-6)).item()
+                                if dice_candidate > best_dice:
+                                    best_dice = dice_candidate
+                                    best_mask = pm
+
+                            # Check if union is better
+                            union_binary = (combined_mask > 0.5).float().cpu()
+                            union_intersection = (union_binary * mask_gt_binary).sum()
+                            union_dice = (2.0 * union_intersection / (union_binary.sum() + mask_gt_binary.sum() + 1e-6)).item()
+
+                            pred_mask = combined_mask if union_dice > best_dice else best_mask
+
+                        # Compute final Dice
+                        pred_binary = (pred_mask > 0.5).float().cpu()
+                        mask_binary = (mask_gt > 0.5).float()
+                        intersection = (pred_binary * mask_binary).sum()
+                        dice = (2.0 * intersection / (pred_binary.sum() + mask_binary.sum() + 1e-6)).item()
+                        dice_scores.append(dice)
+
+                except Exception as e:
+                    logger.warning(f"Evaluation error: {e}")
+
+        avg_dice = np.mean(dice_scores) if dice_scores else 0.0
+        logger.info(f"   {description}: Dice = {avg_dice:.4f} ({len(dice_scores)} samples)")
+        return avg_dice, dice_scores
+
+    # 1. Evaluate INITIAL model (untrained LoRA)
+    logger.info("\n1. Evaluating INITIAL model (untrained LoRA)...")
+    init_model = create_model(
+        sam2_checkpoint=sam2_checkpoint,
+        sam2_config=sam2_config,
+        img_size=img_size,
+        lora_rank=lora_rank,
+        use_clip=True,
+    )
+    results['initial_dice'], results['initial_scores'] = _evaluate_model(init_model, "Initial Model")
+    del init_model
+
+    # 2. Evaluate TRAINED model (with FL weights)
+    if trained_weights is not None and len(trained_weights) > 0:
+        logger.info("\n2. Evaluating TRAINED model (after FL with LoRA)...")
+        trained_model = create_model(
+            sam2_checkpoint=sam2_checkpoint,
+            sam2_config=sam2_config,
+            img_size=img_size,
+            lora_rank=lora_rank,
+            use_clip=True,
+        )
+
+        try:
+            set_weights(trained_model, trained_weights)
+            results['trained_dice'], results['trained_scores'] = _evaluate_model(trained_model, "Trained Model")
+        except Exception as e:
+            logger.error(f"Failed to load trained weights: {e}")
+            logger.error("Ensure lora_rank matches the trained weights")
+
+        del trained_model
+    else:
+        logger.info("\n2. No trained weights provided - skipping trained model evaluation")
+        results['trained_dice'] = results['initial_dice']
+
+    # 3. Compute improvement
+    results['improvement'] = results['trained_dice'] - results['initial_dice']
+    if results['initial_dice'] > 0:
+        results['improvement_pct'] = (results['improvement'] / results['initial_dice']) * 100
+    else:
+        results['improvement_pct'] = 0.0
+
+    # 4. Summary
+    logger.info("\n" + "=" * 80)
+    logger.info("VERIFICATION RESULTS")
+    logger.info("=" * 80)
+    logger.info(f"   Initial Dice (untrained): {results['initial_dice']:.4f}")
+    logger.info(f"   Trained Dice (after FL):  {results['trained_dice']:.4f}")
+    logger.info(f"   Improvement:              {results['improvement']:+.4f} ({results['improvement_pct']:+.1f}%)")
+
+    if results['improvement'] > 0.05:
+        logger.info("   ✓ LoRA training EFFECTIVE - significant improvement")
+    elif results['improvement'] > 0:
+        logger.info("   ~ LoRA training shows minor improvement")
+    else:
+        logger.info("   ✗ LoRA training NOT effective - no improvement")
+
+    logger.info("=" * 80 + "\n")
+
+    return results

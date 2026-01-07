@@ -1,1 +1,0 @@
-"""SAM2 Few-Shot Models for Federated Learning."""
