@@ -325,30 +325,19 @@ def client_fn(context: Context):
     train_loader = None
     test_loader = None
 
-    if not run_syft_flwr():
-        # Local simulation mode - use demo data
-        print(" Loading demo dataset locally...")
-        logger.info("Running flwr locally with demo data")
-        from fl_sam2_lora.task import load_demo_dataset
-        train_loader, test_loader = load_demo_dataset(
-            num_samples=20,
-            target_size=img_size,
-        )
-    else:
+    try:
         # SyftBox mode - load real data
         print(" Loading SyftBox dataset...")
-        logger.info("Running with syft_flwr")
-        try:
-            from fl_sam2_lora.task import load_syftbox_dataset
-            train_loader, test_loader = load_syftbox_dataset(
-                target_size=img_size,
-                modality=modality,
-            )
-        except Exception as e:
-            logger.warning(f"Could not load SyftBox dataset: {e}")
-            logger.info("Falling back to zero-shot mode (no training data)")
-            train_loader = None
-            test_loader = None
+        from fl_sam2_lora.task import load_syftbox_dataset
+        train_loader, test_loader = load_syftbox_dataset(
+            target_size=img_size,
+            modality=modality,
+        )
+    except Exception as e:
+        logger.warning(f"Could not load SyftBox dataset: {e}")
+        logger.info("Falling back to zero-shot mode (no training data)")
+        train_loader = None
+        test_loader = None
 
     return AdaptiveSAM2Client(
         model=model,
