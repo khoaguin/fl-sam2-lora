@@ -253,6 +253,15 @@ class SAM2LoRA(nn.Module):
         """Initialize CLIP for zero-shot and visual similarity."""
         logger.info("Loading CLIP (open-clip-torch) for zero-shot and few-shot...")
         try:
+            # Disable verbose download progress bars
+            try:
+                from huggingface_hub import logging as hf_logging
+                from huggingface_hub.utils import disable_progress_bars
+                hf_logging.set_verbosity_error()
+                disable_progress_bars()
+            except ImportError:
+                pass
+
             # Convert OpenAI CLIP model name to open_clip format
             # ViT-B/32 -> ViT-B-32, ViT-L/14 -> ViT-L-14
             open_clip_name = model_name.replace("/", "-")
