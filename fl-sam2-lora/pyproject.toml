@@ -46,7 +46,7 @@ serverapp = "fl_sam2_lora.server_app:app"
 clientapp = "fl_sam2_lora.client_app:app"
 
 [tool.flwr.app.config]
-num-server-rounds = 5
+num-server-rounds = 2
 partition-id = 0
 num-partitions = 1
 min-available-clients = 1
@@ -57,7 +57,7 @@ fraction-evaluate = 1.0
 # SAM2 specific config
 modality = "ct"
 target-size = 1024
-local-epochs = 5
+local-epochs = 2
 learning-rate = 0.0001
 lora-rank = 16
 use-clip = true
