@@ -1608,8 +1608,33 @@ class SAM2LoRA(nn.Module):
                         logger.info(f"Early stopping at epoch {epoch + 1} (patience={patience_counter})")
                         break
 
-        # Final evaluation
-        eval_metrics = self._fit_zero_shot(test_loader, modality, class_name) if test_loader else {'dice': avg_dice, 'loss': avg_loss}
+        # Final evaluation using LoRA-trained model
+        if test_loader:
+            self.eval()
+            eval_dice_scores = []
+            with torch.no_grad():
+                for batch in test_loader:
+                    if isinstance(batch, dict):
+                        images = batch["image"].to(self.device)
+                        masks = batch["mask"].to(self.device)
+                    else:
+                        images, masks = batch
+                        images = images.to(self.device)
+                        masks = masks.to(self.device)
+
+                    # Use forward_sam2_differentiable (LoRA-trained encoder)
+                    pred_masks = self.forward_sam2_differentiable(images)
+                    if pred_masks.shape[-2:] != masks.shape[-2:]:
+                        pred_masks = F.interpolate(
+                            pred_masks, size=masks.shape[-2:],
+                            mode='bilinear', align_corners=False
+                        )
+                    eval_dice_scores.append(dice_score(pred_masks, masks))
+
+            eval_dice = np.mean(eval_dice_scores) if eval_dice_scores else avg_dice
+            eval_metrics = {'dice': eval_dice, 'loss': 1.0 - eval_dice}
+        else:
+            eval_metrics = {'dice': avg_dice, 'loss': avg_loss}
 
         weights = get_weights(self)
         return weights, eval_metrics, history

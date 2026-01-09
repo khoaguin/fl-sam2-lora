@@ -238,6 +238,10 @@ class AdaptiveSAM2Client(NumPyClient):
                             class_names=[self.class_name, "tissue"],
                             similarity_threshold=0.1,
                         )
+                        if predictions:
+                            pred_mask = list(predictions.values())[0]
+                        else:
+                            pred_mask = None
                     elif self.client_type == "few_shot":
                         predictions = self.model.few_shot_segment(
                             image=image,
@@ -245,17 +249,17 @@ class AdaptiveSAM2Client(NumPyClient):
                             class_names=[self.class_name],
                             top_k=3,
                         )
+                        if predictions:
+                            pred_mask = list(predictions.values())[0]
+                        else:
+                            pred_mask = None
                     else:
-                        # LoRA - use zero_shot for consistent eval
-                        predictions = self.model.zero_shot_segment(
-                            image=image,
-                            modality=self.modality,
-                            class_names=[self.class_name, "tissue"],
-                            similarity_threshold=0.1,
-                        )
+                        # LoRA - use forward_sam2_differentiable for proper evaluation
+                        # This uses the LoRA-trained encoder (same as training)
+                        pred_mask = self.model.forward_sam2_differentiable(image)
+                        pred_mask = pred_mask.squeeze()  # Remove batch and channel dims
 
-                    if predictions:
-                        pred_mask = list(predictions.values())[0]
+                    if pred_mask is not None:
                         pred_binary = (pred_mask > 0.5).float().cpu()
                         mask_binary = (mask_gt > 0.5).float().cpu()
 
