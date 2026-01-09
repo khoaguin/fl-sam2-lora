@@ -109,11 +109,9 @@ def server_fn(context: Context) -> ServerAppComponents:
     # Setup output directory for model saving
     from syft_flwr.strategy import FedAvgWithModelSaving
 
-    output_dir = os.getenv("OUTPUT_DIR")
-    if output_dir is None:
-        output_dir = Path.home() / ".syftbox/rds/"
-        output_dir.mkdir(parents=True, exist_ok=True)
-    save_path = Path(output_dir) / "sam2_lora_weights"
+    output_dir = Path(os.getenv("OUTPUT_DIR") or "./models/finetuned")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    save_path = output_dir / "sam2_lora_weights"
 
     # Get strategy parameters
     min_available_clients = context.run_config.get("min-available-clients", 1)
