@@ -254,9 +254,34 @@ class AdaptiveSAM2Client(NumPyClient):
                         else:
                             pred_mask = None
                     else:
-                        # LoRA - use forward_sam2_differentiable for proper evaluation
-                        # This uses the LoRA-trained encoder (same as training)
-                        pred_mask = self.model.forward_sam2_differentiable(image)
+                        # LoRA - use forward_sam2_differentiable with proper point prompts
+                        # Extract point prompts from GT mask (same as training)
+                        import torch
+                        device = next(self.model.parameters()).device
+                        img_size = self.model.img_size
+                        H_orig, W_orig = mask_gt.shape[-2:]
+
+                        # Get foreground coordinates from GT mask
+                        fg_coords = torch.nonzero(mask_gt > 0.5, as_tuple=False).float()
+
+                        if len(fg_coords) > 0:
+                            # Use centroid as primary prompt (most reliable)
+                            centroid = fg_coords.mean(dim=0)
+                            x_cent = centroid[1].item() * img_size / W_orig
+                            y_cent = centroid[0].item() * img_size / H_orig
+
+                            point_coords = torch.tensor([[[x_cent, y_cent]]],
+                                                        dtype=torch.float32, device=device)
+                            point_labels = torch.ones(1, 1, dtype=torch.int32, device=device)
+                        else:
+                            # Fallback to center if no foreground
+                            point_coords = torch.tensor([[[img_size // 2, img_size // 2]]],
+                                                        dtype=torch.float32, device=device)
+                            point_labels = torch.ones(1, 1, dtype=torch.int32, device=device)
+
+                        pred_mask = self.model.forward_sam2_differentiable(
+                            image, point_coords=point_coords, point_labels=point_labels
+                        )
                         pred_mask = pred_mask.squeeze()  # Remove batch and channel dims
 
                     if pred_mask is not None:
