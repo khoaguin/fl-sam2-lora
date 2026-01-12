@@ -46,7 +46,7 @@ serverapp = "fl_sam2_lora.server_app:app"
 clientapp = "fl_sam2_lora.client_app:app"
 
 [tool.flwr.app.config]
-num-server-rounds = 10
+num-server-rounds = 15
 partition-id = 0
 num-partitions = 1
 min-available-clients = 1
@@ -58,9 +58,12 @@ fraction-evaluate = 1.0
 modality = "ct"
 target-size = 1024
 local-epochs = 8
-learning-rate = 0.0001
+learning-rate = 0.00007
 lora-rank = 64
 use-clip = true
+# FedProx for stable FL training
+use-fedprox = true
+fedprox-mu = 0.01
 
 [tool.flwr.federations]
 default = "local-simulation"
