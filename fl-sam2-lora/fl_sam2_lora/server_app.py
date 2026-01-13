@@ -135,6 +135,28 @@ def server_fn(context: Context) -> ServerAppComponents:
 
     print(f"   FedProx: {'Enabled' if use_fedprox else 'Disabled'} (μ={fedprox_mu})")
 
+    # Learning rate decay configuration
+    base_lr = context.run_config.get("learning-rate", 5e-5)
+    lr_decay = context.run_config.get("lr-decay", 0.9)  # Decay factor per round
+    min_lr = context.run_config.get("min-lr", 1e-5)  # Minimum learning rate
+    local_epochs = context.run_config.get("local-epochs", 5)
+
+    def get_fit_config(round_num: int) -> dict:
+        """Generate config with decaying learning rate."""
+        import math
+        # Cosine annealing decay
+        decayed_lr = min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * round_num / num_rounds))
+        print(f"   Round {round_num}: LR = {decayed_lr:.6f}")
+        return {
+            "local_epochs": local_epochs,
+            "learning_rate": decayed_lr,
+            "round": round_num,
+            "use_fedprox": use_fedprox,
+            "fedprox_mu": fedprox_mu,
+        }
+
+    print(f"   LR Schedule: Cosine decay from {base_lr} to {min_lr} over {num_rounds} rounds")
+
     # Create FedAvg strategy with model saving
     strategy = FedAvgWithModelSaving(
         save_path=save_path,
@@ -146,15 +168,7 @@ def server_fn(context: Context) -> ServerAppComponents:
         initial_parameters=initial_params,
         fit_metrics_aggregation_fn=weighted_dice_average,
         evaluate_metrics_aggregation_fn=weighted_dice_average,
-        # Custom config to pass to clients
-        on_fit_config_fn=lambda round_num: {
-            "local_epochs": context.run_config.get("local-epochs", 5),
-            "learning_rate": context.run_config.get("learning-rate", 5e-5),
-            "round": round_num,
-            # FedProx regularization for stable FL training
-            "use_fedprox": use_fedprox,
-            "fedprox_mu": fedprox_mu,
-        },
+        on_fit_config_fn=get_fit_config,
     )
 
     config = ServerConfig(num_rounds=num_rounds)

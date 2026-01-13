@@ -58,12 +58,14 @@ fraction-evaluate = 1.0
 modality = "ct"
 target-size = 1024
 local-epochs = 8
-learning-rate = 0.00007
+learning-rate = 0.0001
 lora-rank = 64
 use-clip = true
 # FedProx for stable FL training
 use-fedprox = true
-fedprox-mu = 0.01
+fedprox-mu = 0.005
+# LR decay (cosine annealing)
+min-lr = 0.00001
 
 [tool.flwr.federations]
 default = "local-simulation"
